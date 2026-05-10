@@ -8,6 +8,8 @@ import com.taskflow.entity.Task;
 import com.taskflow.entity.User;
 import com.taskflow.exception.AccessDeniedException;
 import com.taskflow.exception.ResourceNotFoundException;
+import com.taskflow.kafka.NotificationProducer;
+import com.taskflow.kafka.event.CommentAddedEvent;
 import com.taskflow.repository.CommentRepository;
 import com.taskflow.repository.ProjectRepository;
 import com.taskflow.repository.TaskRepository;
@@ -28,6 +30,7 @@ public class CommentService {
     private final TaskRepository taskRepository;
     private final UserRepository userRepository;
     private final ProjectRepository projectRepository;
+    private final NotificationProducer notificationProducer;
 
     public PageResponse<CommentResponse> getComments(UUID taskId, UUID userId, Pageable pageable) {
         Task task = findTaskOrThrow(taskId);
@@ -50,7 +53,15 @@ public class CommentService {
             .author(author)
             .build();
 
-        return CommentResponse.from(commentRepository.save(comment));
+        Comment saved = commentRepository.save(comment);
+
+        notificationProducer.sendCommentAdded(
+            CommentAddedEvent.of(saved.getId(), task.getId(), task.getTitle(),
+                task.getProject().getId(), author.getId(),
+                author.getFullName() != null ? author.getFullName() : author.getUsername(),
+                request.content()));
+
+        return CommentResponse.from(saved);
     }
 
     @Transactional

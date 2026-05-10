@@ -1,5 +1,7 @@
 package com.taskflow.service;
 
+import com.taskflow.aop.Auditable;
+import com.taskflow.config.RedisConfig;
 import com.taskflow.dto.request.CreateTaskRequest;
 import com.taskflow.dto.request.UpdateTaskRequest;
 import com.taskflow.dto.response.PageResponse;
@@ -9,8 +11,13 @@ import com.taskflow.entity.enums.Priority;
 import com.taskflow.entity.enums.TaskStatus;
 import com.taskflow.exception.AccessDeniedException;
 import com.taskflow.exception.ResourceNotFoundException;
+import com.taskflow.kafka.NotificationProducer;
+import com.taskflow.kafka.event.TaskAssignedEvent;
+import com.taskflow.kafka.event.TaskCompletedEvent;
 import com.taskflow.repository.*;
 import lombok.RequiredArgsConstructor;
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.Cacheable;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
@@ -32,6 +39,7 @@ public class TaskService {
     private final ProjectRepository projectRepository;
     private final UserRepository userRepository;
     private final LabelRepository labelRepository;
+    private final NotificationProducer notificationProducer;
 
     public PageResponse<TaskResponse> getTasksByProject(
         UUID projectId, UUID userId, TaskStatus status, Priority priority,
@@ -44,6 +52,7 @@ public class TaskService {
         return PageResponse.from(page);
     }
 
+    @Cacheable(value = RedisConfig.CACHE_TASKS, key = "#taskId")
     public TaskResponse getTask(UUID taskId, UUID userId) {
         Task task = findTaskOrThrow(taskId);
         assertMember(task.getProject().getId(), userId);
@@ -90,13 +99,30 @@ public class TaskService {
             .labels(labels)
             .build();
 
-        return TaskResponse.from(taskRepository.save(task));
+        task = taskRepository.save(task);
+
+        // Publish Kafka event if assignee was set
+        if (assignee != null) {
+            notificationProducer.sendTaskAssigned(
+                TaskAssignedEvent.of(task.getId(), task.getTitle(),
+                    projectId, assignee.getId(), reporterId));
+        }
+
+        return TaskResponse.from(task);
     }
 
     @Transactional
+    @Auditable(action = "UPDATE_TASK")
+    @CacheEvict(value = RedisConfig.CACHE_TASKS, key = "#taskId")
     public TaskResponse updateTask(UUID taskId, UpdateTaskRequest request, UUID userId) {
         Task task = findTaskOrThrow(taskId);
         assertMember(task.getProject().getId(), userId);
+
+        boolean wasAssigneeChanged = request.assigneeId() != null
+            && !request.assigneeId().equals(task.getAssignee() != null ? task.getAssignee().getId() : null);
+
+        boolean wasCompleted = request.status() == TaskStatus.DONE
+            && task.getStatus() != TaskStatus.DONE;
 
         if (request.title() != null) task.setTitle(request.title());
         if (request.description() != null) task.setDescription(request.description());
@@ -105,19 +131,34 @@ public class TaskService {
         if (request.dueDate() != null) task.setDueDate(request.dueDate());
 
         if (request.assigneeId() != null) {
-            User assignee = userRepository.findById(request.assigneeId())
+            User newAssignee = userRepository.findById(request.assigneeId())
                 .orElseThrow(() -> new ResourceNotFoundException("User", request.assigneeId()));
-            task.setAssignee(assignee);
+            task.setAssignee(newAssignee);
         }
 
         if (request.labelIds() != null) {
             task.setLabels(resolveLabels(request.labelIds(), task.getProject().getId()));
         }
 
-        return TaskResponse.from(taskRepository.save(task));
+        task = taskRepository.save(task);
+
+        // Publish events after successful save
+        if (wasAssigneeChanged && task.getAssignee() != null) {
+            notificationProducer.sendTaskAssigned(
+                TaskAssignedEvent.of(task.getId(), task.getTitle(),
+                    task.getProject().getId(), task.getAssignee().getId(), userId));
+        }
+        if (wasCompleted) {
+            notificationProducer.sendTaskCompleted(
+                TaskCompletedEvent.of(task.getId(), task.getTitle(),
+                    task.getProject().getId(), userId));
+        }
+
+        return TaskResponse.from(task);
     }
 
     @Transactional
+    @CacheEvict(value = RedisConfig.CACHE_TASKS, key = "#taskId")
     public void deleteTask(UUID taskId, UUID userId) {
         Task task = findTaskOrThrow(taskId);
         assertMember(task.getProject().getId(), userId);
