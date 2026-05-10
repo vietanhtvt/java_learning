@@ -24,19 +24,10 @@
 16. [Redis Cache — @Cacheable & RedisCacheManager](#16-redis-cache--cacheable--rediscachemanager)
 17. [Spring AOP — LoggingAspect & AuditAspect](#17-spring-aop--loggingaspect--auditaspect)
 18. [Apache Kafka — Event-Driven Architecture](#18-apache-kafka--event-driven-architecture)
-3. [JPA Auditing & BaseEntity](#3-jpa-auditing--baseentity)
-4. [Entity Relationships & Fetch Strategy](#4-entity-relationships--fetch-strategy)
-5. [Flyway Database Migration](#5-flyway-database-migration)
-6. [Repository Pattern & Custom JPQL](#6-repository-pattern--custom-jpql)
-7. [Service Layer & Transactions](#7-service-layer--transactions)
-8. [DTO Pattern với Java Records](#8-dto-pattern-với-java-records)
-9. [Spring Security 6 — STATELESS Architecture](#9-spring-security-6--stateless-architecture)
-10. [JWT Authentication (JJWT 0.12)](#10-jwt-authentication-jjwt-012)
-11. [Bean Validation & Custom Constraints](#11-bean-validation--custom-constraints)
-12. [Exception Handling — RFC 7807 Problem Details](#12-exception-handling--rfc-7807-problem-details)
-13. [Method-level Security — @PreAuthorize](#13-method-level-security--preauthorize)
-14. [CORS Configuration](#14-cors-configuration)
-15. [Pagination với Spring Data](#15-pagination-với-spring-data)
+19. [Testing — JUnit 5 + Mockito + Testcontainers](#19-testing--junit-5--mockito--testcontainers)
+20. [Docker — Multi-stage Build & docker-compose](#20-docker--multi-stage-build--docker-compose)
+21. [CI/CD — GitHub Actions](#21-cicd--github-actions)
+22. [Actuator & Micrometer — Observability](#22-actuator--micrometer--observability)
 
 ---
 
@@ -1518,6 +1509,678 @@ Giải pháp (chưa implement trong MVP):
 
 ---
 
+## 19. Testing — JUnit 5 + Mockito + Testcontainers
+
+### 19.1 Unit Tests với Mockito
+
+Unit test kiểm tra logic của một class/method **trong cô lập** — tất cả dependencies bị mock.
+
+```java
+@ExtendWith(MockitoExtension.class)   // tích hợp Mockito với JUnit 5
+class TaskServiceTest {
+
+    @Mock TaskRepository taskRepository;
+    @Mock ProjectRepository projectRepository;
+    @Mock NotificationProducer notificationProducer;
+    @Mock Counter taskCreatedCounter;
+    @Mock Counter taskCompletedCounter;
+
+    @InjectMocks TaskService taskService;   // inject tất cả @Mock vào TaskService
+
+    @Nested
+    class CreateTask {
+        @Test
+        void shouldPublishKafkaEventWhenAssigneeSet() {
+            // GIVEN — chuẩn bị dữ liệu
+            UUID projectId = UUID.randomUUID();
+            UUID reporterId = UUID.randomUUID();
+            UUID assigneeId = UUID.randomUUID();
+
+            given(projectRepository.isMember(projectId, reporterId)).willReturn(true);
+            given(projectRepository.findByIdWithOwner(projectId)).willReturn(Optional.of(project));
+            given(userRepository.findById(reporterId)).willReturn(Optional.of(reporter));
+            given(userRepository.findById(assigneeId)).willReturn(Optional.of(assignee));
+            given(taskRepository.save(any())).willAnswer(inv -> inv.getArgument(0));
+
+            // WHEN — thực thi
+            taskService.createTask(projectId, request, reporterId);
+
+            // THEN — kiểm tra kết quả
+            ArgumentCaptor<TaskAssignedEvent> captor =
+                ArgumentCaptor.forClass(TaskAssignedEvent.class);
+            verify(notificationProducer).sendTaskAssigned(captor.capture());
+
+            TaskAssignedEvent event = captor.getValue();
+            assertThat(event.assigneeId()).isEqualTo(assigneeId);
+            assertThat(event.assignedById()).isEqualTo(reporterId);
+        }
+    }
+}
+```
+
+**Giải thích pattern:**
+
+| Thành phần | Vai trò |
+|------------|---------|
+| `@ExtendWith(MockitoExtension.class)` | Thay thế `@RunWith(MockitoJUnitRunner)` của JUnit 4 |
+| `@Mock` | Tạo mock object — tất cả method trả về null/0/false theo mặc định |
+| `@InjectMocks` | Mockito inject tất cả `@Mock` vào constructor/field của class cần test |
+| `given(...).willReturn(...)` | BDD style (Behavior-Driven Development) — dễ đọc hơn `when/thenReturn` |
+| `ArgumentCaptor` | Capture đối số được truyền vào mock để kiểm tra chi tiết |
+| `@Nested` | Nhóm test theo use case — test tree dễ đọc hơn |
+
+**Ưu điểm Unit Test:**
+- Chạy cực nhanh (milliseconds) — không cần DB, Redis, Kafka
+- Kiểm tra logic thuần túy, không bị ảnh hưởng bởi infrastructure
+- Dễ test edge cases (null, exception, race condition)
+
+**Nhược điểm:**
+- Không phát hiện lỗi tích hợp (query SQL sai, serialization lỗi)
+- Mock có thể che giấu behavior thật của dependency
+
+### 19.2 Testcontainers — Integration Tests với Container Thật
+
+Testcontainers tự động start Docker container (PostgreSQL, Redis, Kafka) trong quá trình test, đảm bảo behavior giống production.
+
+```java
+@SpringBootTest(webEnvironment = RANDOM_PORT)
+@Testcontainers
+@ActiveProfiles("test")
+public abstract class AbstractIntegrationTest {
+
+    // static = shared giữa tất cả test method trong class hierarchy
+    // Tránh start/stop container mỗi test → tiết kiệm thời gian
+    @Container
+    static final PostgreSQLContainer<?> POSTGRES =
+        new PostgreSQLContainer<>("postgres:16-alpine")
+            .withDatabaseName("taskflow_test")
+            .withUsername("test")
+            .withPassword("test");
+
+    @Container
+    static final GenericContainer<?> REDIS =
+        new GenericContainer<>("redis:7-alpine")
+            .withExposedPorts(6379);
+
+    @Container
+    static final KafkaContainer KAFKA =
+        new KafkaContainer(DockerImageName.parse("confluentinc/cp-kafka:7.6.0"));
+
+    @DynamicPropertySource
+    static void configureProperties(DynamicPropertyRegistry registry) {
+        // Override application.yml bằng địa chỉ container động
+        registry.add("spring.datasource.url", POSTGRES::getJdbcUrl);
+        registry.add("spring.datasource.username", POSTGRES::getUsername);
+        registry.add("spring.datasource.password", POSTGRES::getPassword);
+        registry.add("spring.data.redis.host", REDIS::getHost);
+        registry.add("spring.data.redis.port", () -> REDIS.getMappedPort(6379));
+        registry.add("spring.kafka.bootstrap-servers", KAFKA::getBootstrapServers);
+    }
+}
+```
+
+**Tại sao dùng `static` container?**
+
+```
+Không static:              static (Shared):
+Test 1: start → test → stop    Container start 1 lần
+Test 2: start → test → stop  → Test 1 chạy
+Test 3: start → test → stop    Test 2 chạy
+                               Test 3 chạy
+Total: 3 × (start_time)        Container stop 1 lần
+                               Total: 1 × (start_time) — nhanh hơn ~3x
+```
+
+**@DynamicPropertySource** giải quyết vấn đề port ngẫu nhiên của container. Port của PostgreSQL container không cố định — mỗi lần start sẽ khác nhau. `@DynamicPropertySource` inject URL/port thật vào Spring context sau khi container đã start.
+
+### 19.3 Integration Tests với TestRestTemplate
+
+```java
+class TaskControllerIT extends AbstractIntegrationTest {
+
+    @Autowired TestRestTemplate restTemplate;
+
+    @Test
+    void shouldReturn403WhenNotMember() {
+        // Đăng ký user khác, không thuộc project
+        String otherToken = registerAndLogin("other@test.com", "other");
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.setBearerAuth(otherToken);
+        HttpEntity<Void> request = new HttpEntity<>(headers);
+
+        ResponseEntity<ProblemDetail> response = restTemplate.exchange(
+            "/api/tasks/{id}", HttpMethod.GET, request, ProblemDetail.class, taskId);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+    }
+}
+```
+
+`TestRestTemplate` là HTTP client cho integration test — thực hiện HTTP call thật đến embedded server, qua toàn bộ filter chain (JWT, CORS, ...) giống production.
+
+### 19.4 Cache Integration Test
+
+```java
+@Test
+void shouldPopulateCacheAfterFirstGet() {
+    // Lần 1: miss cache → hit DB
+    projectService.getProject(projectId, userId);
+
+    // Kiểm tra cache đã được populate
+    Cache.ValueWrapper cached = cacheManager.getCache(CACHE_PROJECTS).get(projectId);
+    assertThat(cached).isNotNull();
+
+    // Lần 2: hit cache → không gọi DB
+    projectService.getProject(projectId, userId);
+    // verify repository chỉ được gọi 1 lần
+    verify(projectRepository, times(1)).findByIdWithMembers(projectId);
+}
+```
+
+**Ưu điểm Integration Tests:**
+- Kiểm tra toàn bộ stack (HTTP → Security → Service → DB)
+- Phát hiện N+1 queries, transaction boundary issues, serialization errors
+- Testcontainers đảm bảo behavior giống production database
+
+**Nhược điểm:**
+- Chậm hơn unit test (~10-30 giây cho mỗi test class)
+- Cần Docker daemon chạy
+- Flaky tests nếu container không healthy kịp
+- Tốn resource (RAM, CPU)
+
+**Chiến lược testing (Testing Pyramid):**
+
+```
+        /\          Integration Tests (ít, chậm, confidence cao)
+       /  \         ← Testcontainers, TestRestTemplate
+      /    \
+     /      \       Service Tests (vừa phải)
+    /        \      ← Mockito unit tests
+   /          \
+  /____________\    Unit Tests (nhiều, nhanh)
+                    ← Pure logic tests, no dependencies
+```
+
+---
+
+## 20. Docker — Multi-stage Build & docker-compose
+
+### 20.1 Multi-stage Dockerfile
+
+```dockerfile
+# ─── Stage 1: Builder ─────────────────────────────────────────────────────────
+FROM eclipse-temurin:21-jdk-alpine AS builder
+WORKDIR /app
+
+COPY pom.xml .
+# Cache Maven dependencies riêng → chỉ re-download khi pom.xml thay đổi
+RUN --mount=type=cache,target=/root/.m2 \
+    mvn dependency:go-offline -q
+
+COPY src ./src
+RUN --mount=type=cache,target=/root/.m2 \
+    mvn package -DskipTests -q
+
+# ─── Stage 2: Runtime ─────────────────────────────────────────────────────────
+FROM eclipse-temurin:21-jre-alpine
+
+# Non-root user — security best practice
+RUN addgroup -S taskflow && adduser -S taskflow -G taskflow
+
+COPY --from=builder /app/target/*.jar app.jar
+
+USER taskflow
+
+EXPOSE 8080
+
+ENTRYPOINT ["java",
+    "-XX:+UseContainerSupport",
+    "-XX:MaxRAMPercentage=75.0",
+    "-jar", "app.jar"]
+```
+
+**Tại sao Multi-stage?**
+
+| Stage | Image | Kích thước |
+|-------|-------|-----------|
+| Builder (JDK) | eclipse-temurin:21-jdk-alpine | ~340 MB |
+| Runtime (JRE) | eclipse-temurin:21-jre-alpine | ~180 MB |
+| Final image | JRE + app.jar | ~220 MB |
+
+JDK chứa compiler, javac, javadoc — không cần thiết trong production. JRE chỉ cần để chạy `.jar`. **Tiết kiệm ~120 MB** và giảm attack surface.
+
+### 20.2 Build Cache với `--mount=type=cache`
+
+```dockerfile
+RUN --mount=type=cache,target=/root/.m2 mvn package -DskipTests
+```
+
+`--mount=type=cache` là BuildKit feature — cache Maven local repository (`~/.m2`) giữa các lần build. Chỉ download lại dependency khi `pom.xml` thay đổi.
+
+```
+Lần build 1: Download 200+ dependencies → 3 phút
+Lần build 2: pom.xml không đổi → cache hit → 30 giây
+Lần build 3: Chỉ src thay đổi → cache hit → 30 giây
+```
+
+**Lưu ý:** `--mount=type=cache` không tương thích với Docker Buildx layer cache thông thường. GitHub Actions dùng `cache-from: type=gha` kết hợp với BuildKit.
+
+### 20.3 JVM Container Flags
+
+```
+-XX:+UseContainerSupport    Đọc CPU/RAM từ cgroup limit của container
+                            (không phải từ host machine)
+-XX:MaxRAMPercentage=75.0   JVM heap tối đa = 75% RAM container
+                            Ví dụ: container 512MB → heap tối đa ~384MB
+                            Còn lại 25% cho non-heap, thread stacks, JVM overhead
+```
+
+**Tại sao cần `UseContainerSupport`?**
+
+Trước Java 10, JVM không hiểu cgroup limits. Nếu container được giới hạn 512MB nhưng host có 16GB, JVM sẽ set heap = 4GB (¼ × 16GB) → container bị kill bởi OOMKiller.
+
+Java 11+ bật mặc định `UseContainerSupport`. Flag vẫn được ghi để minh tường.
+
+### 20.4 Non-root User trong Container
+
+```dockerfile
+RUN addgroup -S taskflow && adduser -S taskflow -G taskflow
+USER taskflow
+```
+
+**-S flag**: system user — không có home directory, không có shell, không thể login. Đây là security principle of least privilege: application không cần quyền root để đọc/chạy file JAR.
+
+Nếu application bị compromise, attacker chỉ có quyền của user `taskflow`, không thể:
+- Cài thêm package (`apt-get`)
+- Đọc file của user khác
+- Bind port < 1024
+
+### 20.5 docker-compose cho Development
+
+```yaml
+services:
+  app:
+    build: ./taskflow
+    ports: ["8080:8080"]
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/taskflow
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    depends_on:
+      postgres:
+        condition: service_healthy   # chờ postgres HEALTHY, không chỉ started
+      kafka:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taskflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    profiles: ["dev"]              # chỉ start khi --profile dev
+    ports: ["8090:8080"]
+```
+
+**`condition: service_healthy`** vs `condition: service_started`:
+
+- `service_started`: container đã start (nhưng service bên trong chưa chắc ready)
+- `service_healthy`: healthcheck command thành công → service thật sự sẵn sàng
+
+Nếu dùng `service_started`, app có thể gặp lỗi "Connection refused" khi PostgreSQL chưa kịp init.
+
+**Ưu điểm docker-compose:**
+- Start toàn bộ stack bằng 1 lệnh: `docker compose up -d`
+- Môi trường nhất quán giữa dev machines
+- Dễ dàng thêm/bỏ service
+
+**Nhược điểm:**
+- Không phù hợp cho production (dùng Kubernetes hoặc ECS thay thế)
+- Không có auto-restart policy nâng cao, scaling
+
+---
+
+## 21. CI/CD — GitHub Actions
+
+### 21.1 Tổng quan Workflow
+
+```yaml
+name: CI/CD
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - 'taskflow/**'          # chỉ trigger khi code thay đổi
+      - '.github/workflows/ci.yml'
+  pull_request:
+    branches: [master, main]
+    paths:
+      - 'taskflow/**'
+
+jobs:
+  test:   # Job 1: Compile + Test
+    ...
+  docker: # Job 2: Build & Push (chỉ khi push lên main/master)
+    needs: test   # phụ thuộc test — chỉ chạy khi test pass
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
+```
+
+**Path filters** (`paths:`) tránh trigger CI khi chỉ thay đổi documentation hay file không liên quan.
+
+### 21.2 Test Job — Service Containers
+
+```yaml
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: taskflow_test
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+```
+
+GitHub Actions **service containers** là Docker container chạy song song với job runner. Khác với Testcontainers (start từ Java code), service containers được quản lý bởi GitHub Actions runner. Cả 2 approach đều valid — project này dùng Testcontainers trong integration test để tự quản lý.
+
+### 21.3 Maven Cache
+
+```yaml
+- name: Set up Java 21
+  uses: actions/setup-java@v4
+  with:
+    java-version: '21'
+    distribution: 'temurin'
+    cache: maven    # cache ~/.m2 giữa các runs
+```
+
+`cache: maven` tự động cache Maven local repository. Cache key dựa trên `pom.xml` checksum → invalidate khi dependencies thay đổi.
+
+**Tiết kiệm:** ~1-2 phút per run thay vì download lại 200+ jars.
+
+### 21.4 Test Separation
+
+```yaml
+- name: Run unit tests
+  run: mvn test -pl . -Dtest="*ServiceTest" -q
+
+- name: Run integration tests
+  run: mvn verify -Dtest="*IT" -DfailIfNoTests=false
+  env:
+    TESTCONTAINERS_RYUK_DISABLED: "false"
+```
+
+Unit tests (`*ServiceTest`) và integration tests (`*IT`) chạy riêng biệt để:
+1. Fail fast — unit test fail ngay, không cần chờ integration tests khởi động container
+2. Rõ ràng error: biết ngay là unit test hay integration test lỗi
+
+`TESTCONTAINERS_RYUK_DISABLED=false`: Ryuk là Testcontainers resource reaper — tự dọn container/network khi JVM exit. Bật trong CI để tránh container leak.
+
+### 21.5 Artifact Upload
+
+```yaml
+- name: Upload test results
+  if: always()   # upload dù test pass hay fail
+  uses: actions/upload-artifact@v4
+  with:
+    name: test-results
+    path: taskflow/target/surefire-reports/
+
+- name: Upload coverage report
+  if: always()
+  uses: actions/upload-artifact@v4
+  with:
+    name: jacoco-report
+    path: taskflow/target/site/jacoco/
+```
+
+`if: always()` đảm bảo test results luôn được upload kể cả khi job fail — cần thiết để debug failing tests.
+
+### 21.6 Docker Build & Push
+
+```yaml
+- name: Extract Docker metadata
+  id: meta
+  uses: docker/metadata-action@v5
+  with:
+    images: ghcr.io/${{ github.repository }}/taskflow-api
+    tags: |
+      type=sha,prefix=sha-           # sha-abc1234
+      type=ref,event=branch          # master
+      type=raw,value=latest,enable={{is_default_branch}}   # latest (chỉ main/master)
+
+- name: Build and push Docker image
+  uses: docker/build-push-action@v5
+  with:
+    context: ./taskflow
+    push: true
+    tags: ${{ steps.meta.outputs.tags }}
+    cache-from: type=gha            # dùng GitHub Actions cache
+    cache-to: type=gha,mode=max     # mode=max cache tất cả layers
+```
+
+**Tagging strategy:**
+- `sha-abc1234` — immutable, truy ra đúng commit đã build
+- `master` — latest build của branch
+- `latest` — chỉ main branch, dùng cho mặc định pull
+
+**`type=gha` cache** lưu Docker layers vào GitHub Actions cache storage (~10GB free). `mode=max` cache tất cả layers kể cả intermediate stages của multi-stage build.
+
+**GHCR (GitHub Container Registry):**
+
+```yaml
+- name: Log in to GitHub Container Registry
+  uses: docker/login-action@v3
+  with:
+    registry: ghcr.io
+    username: ${{ github.actor }}
+    password: ${{ secrets.GITHUB_TOKEN }}   # automatic token, không cần tạo thủ công
+```
+
+`GITHUB_TOKEN` tự động được tạo bởi GitHub Actions cho mỗi run — không cần lưu credentials thủ công. Token có scope `packages: write` như khai báo trong `permissions`.
+
+**Ưu điểm GitHub Actions:**
+- Tích hợp sẵn với GitHub repository, PR, issues
+- GITHUB_TOKEN tự động — bảo mật hơn personal access tokens
+- Marketplace actions phong phú
+- Free tier hào phóng (2000 phút/tháng cho public repo)
+
+**Nhược điểm:**
+- Vendor lock-in GitHub
+- Runner có thể chậm giờ cao điểm
+- Secret scanning kém hơn HashiCorp Vault
+
+---
+
+## 22. Actuator & Micrometer — Observability
+
+### 22.1 Spring Boot Actuator
+
+Actuator expose các HTTP endpoints cho monitoring và management:
+
+```yaml
+# application.yml
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, metrics, prometheus
+  endpoint:
+    health:
+      show-details: when_authorized
+  metrics:
+    tags:
+      application: taskflow
+```
+
+**Các endpoints quan trọng:**
+
+| Endpoint | URL | Mục đích |
+|----------|-----|----------|
+| `/actuator/health` | `GET` | Kiểm tra app, DB, Redis health |
+| `/actuator/metrics` | `GET` | Danh sách tất cả metrics |
+| `/actuator/metrics/{name}` | `GET` | Chi tiết metric cụ thể |
+| `/actuator/prometheus` | `GET` | Export metrics theo format Prometheus |
+| `/actuator/info` | `GET` | App version, git commit info |
+
+### 22.2 Counter vs Gauge
+
+Micrometer có nhiều loại metric. Project dùng 2 loại phổ biến:
+
+**Counter** — chỉ tăng, không giảm, đo **tổng số sự kiện**:
+
+```java
+@Bean
+public Counter taskCreatedCounter(MeterRegistry registry) {
+    return Counter.builder("taskflow.tasks.created")
+        .description("Total number of tasks created")
+        .tag("app", "taskflow")
+        .register(registry);
+}
+
+// Trong service:
+taskCreatedCounter.increment();   // +1 mỗi khi task được tạo
+```
+
+Khi query Prometheus: `rate(taskflow_tasks_created_total[5m])` → tốc độ tạo task trong 5 phút.
+
+**Gauge** — đo **giá trị hiện tại**, có thể tăng và giảm:
+
+```java
+@Bean
+public Gauge tasksInProgressGauge(MeterRegistry registry) {
+    return Gauge.builder("taskflow.tasks.in_progress",
+            taskRepository,
+            repo -> repo.countByStatus(TaskStatus.IN_PROGRESS))  // lazy query
+        .description("Current number of tasks in progress")
+        .tag("app", "taskflow")
+        .register(registry);
+}
+```
+
+`Gauge` không lưu value — mỗi lần Prometheus scrape, hàm lambda `repo -> repo.countByStatus(...)` được gọi để lấy giá trị hiện tại từ DB.
+
+**So sánh Counter vs Gauge:**
+
+| Đặc điểm | Counter | Gauge |
+|-----------|---------|-------|
+| Chiều tăng | Chỉ tăng | Tăng/giảm |
+| Dùng cho | Events (requests, errors, tasks created) | Current state (queue size, connections, in-progress tasks) |
+| Query | `rate(metric[5m])` (tốc độ) | Giá trị trực tiếp |
+| Reset khi restart | Về 0 | Query DB lại |
+
+**Các loại metric khác trong Micrometer:**
+
+| Loại | Dùng cho |
+|------|---------|
+| `Timer` | Đo thời gian và count (HTTP request latency) |
+| `DistributionSummary` | Phân phối giá trị (response size, payload size) |
+| `LongTaskTimer` | Đo long-running task (background job đang chạy) |
+
+### 22.3 Prometheus Scraping Flow
+
+```
+App (port 8080)                Prometheus              Grafana
+/actuator/prometheus  ←scrape every 15s→  store TSDB  →  visualize
+                               │
+                        Alert Manager
+                               │
+                         PagerDuty/Slack
+```
+
+**Prometheus format** (text-based):
+
+```
+# HELP taskflow_tasks_created_total Total number of tasks created
+# TYPE taskflow_tasks_created_total counter
+taskflow_tasks_created_total{app="taskflow",} 42.0
+
+# HELP taskflow_tasks_in_progress Current number of tasks in progress
+# TYPE taskflow_tasks_in_progress gauge
+taskflow_tasks_in_progress{app="taskflow",} 7.0
+```
+
+### 22.4 Tags (Labels)
+
+```java
+Counter.builder("taskflow.tasks.completed")
+    .tag("app", "taskflow")          // global tag
+    .tag("environment", "production")
+    .register(registry);
+```
+
+Tags cho phép filter và aggregate trong Prometheus/Grafana:
+
+```promql
+# Tổng task completed của tất cả instances
+sum(taskflow_tasks_completed_total{app="taskflow"})
+
+# Rate theo environment
+rate(taskflow_tasks_completed_total{environment="production"}[5m])
+```
+
+**Cảnh báo về High Cardinality Tags:** Đừng dùng tag có giá trị không bounded như `userId`, `taskId`. Mỗi unique tag combination = 1 time series riêng → Prometheus OOM với hàng triệu series.
+
+```java
+// ❌ Nguy hiểm — unbounded cardinality
+Counter.builder("task.operations")
+    .tag("taskId", taskId.toString())   // triệu task = triệu time series
+    .register(registry);
+
+// ✅ Đúng — bounded values
+Counter.builder("task.operations")
+    .tag("operation", "create")         // create/update/delete = 3 values
+    .tag("priority", priority.name())   // LOW/MEDIUM/HIGH/CRITICAL = 4 values
+    .register(registry);
+```
+
+### 22.5 Health Checks
+
+Spring Boot Actuator tự động expose health indicators cho:
+- **DB** (`DataSourceHealthIndicator`): ping PostgreSQL
+- **Redis** (`RedisHealthIndicator`): ping Redis server
+- **Kafka** (`KafkaHealthIndicator`): check broker connectivity
+- **Disk space** (`DiskSpaceHealthIndicator`): kiểm tra không gian đĩa
+
+```json
+// GET /actuator/health
+{
+  "status": "UP",
+  "components": {
+    "db": { "status": "UP", "details": { "database": "PostgreSQL", "version": "16.2" } },
+    "redis": { "status": "UP", "details": { "version": "7.2.4" } },
+    "kafka": { "status": "UP" }
+  }
+}
+```
+
+Kubernetes/ECS có thể dùng `/actuator/health` làm **liveness/readiness probe** — tự động restart container khi DB connection fail.
+
+**Ưu điểm Actuator + Micrometer:**
+- Zero-code metrics — Spring Boot tự động expose JVM, HTTP, DB pool metrics
+- Vendor-neutral — cùng code chạy với Prometheus, Datadog, CloudWatch
+- Production-ready observability mà không cần thêm sidecar agent
+
+**Nhược điểm:**
+- Actuator endpoints cần bảo mật cẩn thận (không expose `/actuator/*` ra internet)
+- Micrometer overhead nhỏ cho Counter/Timer (negligible trong hầu hết use cases)
+- Gauge chạy query DB mỗi lần scrape — cần cẩn thận với query nặng
+
+---
+
 ## Tổng kết — Technology Decision Matrix
 
 | Kỹ thuật | Dùng khi | Không dùng khi |
@@ -1542,3 +2205,20 @@ Giải pháp (chưa implement trong MVP):
 | Kafka | Async event, decoupled services | Simple notification, monolith nhỏ |
 | Kafka Records (event) | Event payload | Command (direct action) |
 | Virtual Threads | I/O-bound workload (Kafka consumer, API) | CPU-bound tasks |
+| Mockito `@Mock` | Unit test — isolate logic | Khi cần test tích hợp thật |
+| `@InjectMocks` | Inject tất cả mocks vào class cần test | Complex setup cần factory method |
+| `ArgumentCaptor` | Kiểm tra đối số truyền vào mock | Chỉ cần verify mock được gọi |
+| Testcontainers | Integration test với service thật | Unit test, CI không có Docker |
+| `static` container | Shared giữa test methods — tiết kiệm start time | Cần isolation tuyệt đối |
+| `@DynamicPropertySource` | Override config với port container động | Config cố định |
+| TestRestTemplate | Full HTTP integration test | Unit/service test |
+| Multi-stage Docker | Production image nhỏ, secure | Prototype/dev only |
+| `--mount=type=cache` | Cache Maven deps giữa builds | Docker < 18.09 (không có BuildKit) |
+| `UseContainerSupport` | JVM trên container | Bare metal (không có cgroup limits) |
+| Non-root container user | Security hardening | Dev convenience |
+| GitHub Actions | CI/CD tích hợp GitHub | Self-hosted CI, GitLab |
+| `condition: service_healthy` | Chờ service thật sự ready | Quick scripts không cần init |
+| Actuator `/health` | Liveness/readiness probe | Không deploy lên Kubernetes/ECS |
+| Counter | Đếm sự kiện (tasks created, errors) | Giá trị hiện tại có thể giảm |
+| Gauge | Trạng thái hiện tại (in-progress count) | Tổng sự kiện theo thời gian |
+| Micrometer Tags | Filter/aggregate metrics | High cardinality values (userId, taskId) |

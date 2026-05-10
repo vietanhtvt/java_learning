@@ -15,7 +15,9 @@ import com.taskflow.kafka.NotificationProducer;
 import com.taskflow.kafka.event.TaskAssignedEvent;
 import com.taskflow.kafka.event.TaskCompletedEvent;
 import com.taskflow.repository.*;
+import io.micrometer.core.instrument.Counter;
 import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.data.domain.Page;
@@ -40,6 +42,8 @@ public class TaskService {
     private final UserRepository userRepository;
     private final LabelRepository labelRepository;
     private final NotificationProducer notificationProducer;
+    private final Counter taskCreatedCounter;
+    private final Counter taskCompletedCounter;
 
     public PageResponse<TaskResponse> getTasksByProject(
         UUID projectId, UUID userId, TaskStatus status, Priority priority,
@@ -100,6 +104,7 @@ public class TaskService {
             .build();
 
         task = taskRepository.save(task);
+        taskCreatedCounter.increment();
 
         // Publish Kafka event if assignee was set
         if (assignee != null) {
@@ -149,6 +154,7 @@ public class TaskService {
                     task.getProject().getId(), task.getAssignee().getId(), userId));
         }
         if (wasCompleted) {
+            taskCompletedCounter.increment();
             notificationProducer.sendTaskCompleted(
                 TaskCompletedEvent.of(task.getId(), task.getTitle(),
                     task.getProject().getId(), userId));

@@ -73,4 +73,6 @@ public interface TaskRepository extends JpaRepository<Task, UUID> {
                                         Pageable pageable);
 
     long countByProjectIdAndStatus(UUID projectId, TaskStatus status);
+
+    long countByStatus(TaskStatus status);
 }
