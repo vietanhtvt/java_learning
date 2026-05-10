@@ -1,7 +1,7 @@
 package com.taskflow.dto.request;
 
 import com.taskflow.entity.enums.Priority;
-import jakarta.validation.constraints.Future;
+import com.taskflow.validation.FutureDueDate;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Size;
@@ -21,7 +21,7 @@ public record CreateTaskRequest(
     @NotNull(message = "Priority is required")
     Priority priority,
 
-    @Future(message = "Due date must be in the future")
+    @FutureDueDate
     LocalDate dueDate,
 
     UUID assigneeId,
