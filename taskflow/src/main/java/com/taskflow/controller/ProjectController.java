@@ -14,6 +14,7 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.data.web.PageableDefault;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.security.core.userdetails.UserDetails;
 import org.springframework.web.bind.annotation.*;
@@ -59,6 +60,7 @@ public class ProjectController {
 
     @PutMapping("/{projectId}")
     @Operation(summary = "Update project")
+    @PreAuthorize("@projectSecurity.isOwner(#projectId, authentication)")
     public ResponseEntity<ProjectResponse> updateProject(
         @PathVariable UUID projectId,
         @Valid @RequestBody UpdateProjectRequest request,
@@ -69,6 +71,7 @@ public class ProjectController {
 
     @DeleteMapping("/{projectId}")
     @Operation(summary = "Delete project")
+    @PreAuthorize("@projectSecurity.isOwner(#projectId, authentication)")
     @ResponseStatus(HttpStatus.NO_CONTENT)
     public void deleteProject(
         @PathVariable UUID projectId,
@@ -79,6 +82,7 @@ public class ProjectController {
 
     @PostMapping("/{projectId}/members")
     @Operation(summary = "Add member to project")
+    @PreAuthorize("@projectSecurity.isOwner(#projectId, authentication)")
     @ResponseStatus(HttpStatus.CREATED)
     public void addMember(
         @PathVariable UUID projectId,
@@ -90,6 +94,7 @@ public class ProjectController {
 
     @DeleteMapping("/{projectId}/members/{memberId}")
     @Operation(summary = "Remove member from project")
+    @PreAuthorize("@projectSecurity.isOwner(#projectId, authentication)")
     @ResponseStatus(HttpStatus.NO_CONTENT)
     public void removeMember(
         @PathVariable UUID projectId,
