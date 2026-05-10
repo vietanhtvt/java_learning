@@ -2,6 +2,7 @@ package com.taskflow.dto.request;
 
 import com.taskflow.entity.enums.Priority;
 import com.taskflow.entity.enums.TaskStatus;
+import com.taskflow.validation.FutureDueDate;
 import jakarta.validation.constraints.Size;
 
 import java.time.LocalDate;
@@ -19,6 +20,7 @@ public record UpdateTaskRequest(
 
     Priority priority,
 
+    @FutureDueDate
     LocalDate dueDate,
 
     UUID assigneeId,
