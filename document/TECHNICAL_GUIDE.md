@@ -21,6 +21,22 @@
 13. [Method-level Security — @PreAuthorize](#13-method-level-security--preauthorize)
 14. [CORS Configuration](#14-cors-configuration)
 15. [Pagination với Spring Data](#15-pagination-với-spring-data)
+16. [Redis Cache — @Cacheable & RedisCacheManager](#16-redis-cache--cacheable--rediscachemanager)
+17. [Spring AOP — LoggingAspect & AuditAspect](#17-spring-aop--loggingaspect--auditaspect)
+18. [Apache Kafka — Event-Driven Architecture](#18-apache-kafka--event-driven-architecture)
+3. [JPA Auditing & BaseEntity](#3-jpa-auditing--baseentity)
+4. [Entity Relationships & Fetch Strategy](#4-entity-relationships--fetch-strategy)
+5. [Flyway Database Migration](#5-flyway-database-migration)
+6. [Repository Pattern & Custom JPQL](#6-repository-pattern--custom-jpql)
+7. [Service Layer & Transactions](#7-service-layer--transactions)
+8. [DTO Pattern với Java Records](#8-dto-pattern-với-java-records)
+9. [Spring Security 6 — STATELESS Architecture](#9-spring-security-6--stateless-architecture)
+10. [JWT Authentication (JJWT 0.12)](#10-jwt-authentication-jjwt-012)
+11. [Bean Validation & Custom Constraints](#11-bean-validation--custom-constraints)
+12. [Exception Handling — RFC 7807 Problem Details](#12-exception-handling--rfc-7807-problem-details)
+13. [Method-level Security — @PreAuthorize](#13-method-level-security--preauthorize)
+14. [CORS Configuration](#14-cors-configuration)
+15. [Pagination với Spring Data](#15-pagination-với-spring-data)
 
 ---
 
@@ -1117,6 +1133,391 @@ page.isLast();           // Page cuối chưa?
 
 ---
 
+## 16. Redis Cache — @Cacheable & RedisCacheManager
+
+### 16.1 Tại sao cần Cache?
+
+Mỗi request `GET /api/tasks/{id}` đều query PostgreSQL. Nếu có 1000 user cùng xem task nổi tiếng → 1000 DB query giống nhau trong 1 giây. Cache giải quyết vấn đề này bằng cách lưu kết quả vào bộ nhớ nhanh hơn.
+
+```
+Không cache:
+  Client → API → PostgreSQL → trả về (mỗi request ~10ms DB)
+
+Có Redis cache:
+  Client → API → Redis HIT → trả về ngay (< 1ms)
+                └→ Redis MISS → PostgreSQL → lưu vào Redis → trả về
+```
+
+### 16.2 RedisCacheManager với TTL riêng cho từng cache
+
+```java
+@Bean
+public CacheManager cacheManager(RedisConnectionFactory connectionFactory) {
+    RedisCacheConfiguration defaultConfig = defaultCacheConfig();
+
+    Map<String, RedisCacheConfiguration> cacheConfigs = Map.of(
+        CACHE_PROJECTS, defaultConfig.entryTtl(Duration.ofMinutes(10)), // project ít thay đổi
+        CACHE_TASKS,    defaultConfig.entryTtl(Duration.ofMinutes(5)),  // task thay đổi thường hơn
+        CACHE_USERS,    defaultConfig.entryTtl(Duration.ofMinutes(30))  // user hiếm khi thay đổi
+    );
+
+    return RedisCacheManager.builder(connectionFactory)
+        .cacheDefaults(defaultConfig)
+        .withInitialCacheConfigurations(cacheConfigs)  // override TTL per cache
+        .build();
+}
+```
+
+**Tại sao TTL khác nhau?**
+- `projects` cache: project bị update ít — TTL 10 phút OK
+- `tasks` cache: task có thể thay đổi status liên tục — TTL 5 phút an toàn hơn
+- Nếu TTL quá dài → stale data; quá ngắn → cache không có giá trị
+
+### 16.3 Các annotation Cache
+
+```java
+// Lưu kết quả vào cache với key = projectId
+@Cacheable(value = "projects", key = "#projectId")
+public ProjectResponse getProject(UUID projectId, UUID userId) { ... }
+// Lần đầu: DB query → lưu vào Redis key "projects::projectId"
+// Các lần sau: đọc từ Redis, KHÔNG vào method body
+
+// Xóa cache khi update (cache đã stale)
+@CacheEvict(value = "projects", key = "#projectId")
+public ProjectResponse updateProject(UUID projectId, ...) { ... }
+
+// Xóa nhiều cache cùng lúc
+@Caching(evict = {
+    @CacheEvict(value = "projects", key = "#projectId"),
+    @CacheEvict(value = "tasks", allEntries = true) // xóa toàn bộ tasks cache
+})
+public void deleteProject(UUID projectId, ...) { ... }
+```
+
+### 16.4 Serialization trong Redis
+
+```java
+// Vấn đề: Redis lưu byte[], cần serialize Java object → bytes và ngược lại
+// TaskFlow dùng JSON serialization với type info:
+
+ObjectMapper mapper = new ObjectMapper();
+mapper.registerModule(new JavaTimeModule());         // Cho LocalDate, LocalDateTime
+mapper.activateDefaultTyping(..., JsonTypeInfo.As.PROPERTY);
+// → Lưu type info vào JSON để deserialize đúng class
+
+// Redis key: "tasks::550e8400-e29b-41d4-a716"
+// Redis value: {"@class":"com.taskflow.dto.response.TaskResponse","id":"550e...",...)
+```
+
+**Ưu điểm:**
+- Đọc từ Redis nhanh hơn DB 10-100x với data đã cache
+- Giảm tải cho PostgreSQL đáng kể trong high-traffic
+
+**Nhược điểm:**
+- **Cache Invalidation** — vấn đề khó nhất trong cache: khi nào xóa cache?
+  - `@CacheEvict` xóa sau write → trong khoảng thời gian ngắn, có thể serve stale data
+- **Cache Stampede** — nhiều request cùng miss cache → đổ vào DB cùng lúc. Giải quyết bằng Lua script lock hoặc probabilistic early expiration
+- Tăng độ phức tạp của hệ thống — thêm một điểm failure (Redis down)
+
+### 16.5 @Cacheable chỉ hoạt động với Spring Proxy
+
+```java
+// ❌ Gọi nội bộ trong cùng class → cache KHÔNG hoạt động
+@Service
+public class ProjectService {
+    public void someMethod() {
+        getProject(id, userId); // Gọi trực tiếp, bypass Spring proxy → không cache
+    }
+
+    @Cacheable("projects")
+    public ProjectResponse getProject(UUID id, UUID userId) { ... }
+}
+
+// ✅ Cache hoạt động khi gọi qua Spring bean
+ProjectService projectService; // inject
+projectService.getProject(id, userId); // → qua proxy → cache check
+```
+
+---
+
+## 17. Spring AOP — LoggingAspect & AuditAspect
+
+### 17.1 AOP là gì?
+
+**Aspect-Oriented Programming** — cách tách "cross-cutting concerns" (logging, audit, security, metrics) ra khỏi business logic.
+
+```
+Không AOP — logic bị lẫn với infrastructure:
+  public TaskResponse createTask(...) {
+      log.info("Creating task...");          // logging
+      long start = System.currentTimeMillis();
+      auditLog.save(...);                    // audit
+      // business logic
+      long time = System.currentTimeMillis() - start;
+      log.info("Done in {}ms", time);        // logging
+  }
+
+Với AOP — business logic thuần túy:
+  public TaskResponse createTask(...) {
+      // chỉ có business logic
+      // LoggingAspect tự động wrap quanh method này
+  }
+```
+
+### 17.2 Các khái niệm AOP
+
+```
+Aspect   — Class chứa cross-cutting logic (LoggingAspect, AuditAspect)
+Advice   — Method trong Aspect được thực thi (@Before, @After, @Around)
+Pointcut — Biểu thức xác định method nào bị intercept
+JoinPoint— Thời điểm cụ thể bị intercept (method call)
+```
+
+```java
+// Pointcut: tất cả public method trong package service
+@Pointcut("execution(public * com.taskflow.service.*.*(..))")
+public void serviceMethods() {}
+
+// Advice: @Around = wrap quanh method (chạy trước + sau)
+@Around("serviceMethods()")
+public Object logExecution(ProceedingJoinPoint joinPoint) throws Throwable {
+    long start = System.currentTimeMillis();
+    try {
+        Object result = joinPoint.proceed(); // Chạy method gốc
+        log.debug("← {}ms", System.currentTimeMillis() - start);
+        return result;
+    } catch (Throwable ex) {
+        log.warn("✕ threw {}", ex.getMessage());
+        throw ex; // Re-throw để caller xử lý
+    }
+}
+```
+
+**4 loại Advice:**
+| Annotation | Khi nào chạy | Có thể modify result? |
+|------------|-------------|----------------------|
+| `@Before`  | Trước method | Không |
+| `@After`   | Sau method (dù exception) | Không |
+| `@AfterReturning` | Sau method success | Có (binding returnValue) |
+| `@Around`  | Wrap hoàn toàn | Có (có thể thay đổi result hoặc skip method) |
+
+### 17.3 @Auditable — Custom Annotation Advice
+
+```java
+// Annotation marker — đặt trên method cần audit
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface Auditable {
+    String action();   // "CREATE_PROJECT", "UPDATE_TASK"...
+}
+
+// Pointcut dựa trên annotation — chỉ intercept method có @Auditable
+@Around("@annotation(com.taskflow.aop.Auditable)")
+public Object audit(ProceedingJoinPoint joinPoint) throws Throwable {
+    Object result = joinPoint.proceed(); // Business logic chạy trước
+
+    try {
+        saveAuditLog(auditable, joinPoint.getArgs());
+    } catch (Exception ex) {
+        log.error("Audit failed", ex); // Không để audit fail crash business
+    }
+
+    return result;
+}
+```
+
+**Tại sao business logic chạy trước rồi mới audit?**
+Nếu business logic fail (rollback), không nên ghi audit log. Ghi audit sau khi `proceed()` thành công đảm bảo chỉ log operation thực sự xảy ra.
+
+### 17.4 @Async + REQUIRES_NEW cho Audit
+
+```java
+@Async           // Chạy trên thread riêng — không block response trả về
+@Transactional(propagation = Propagation.REQUIRES_NEW)
+// REQUIRES_NEW = tạo transaction mới, độc lập với business transaction
+// Đảm bảo audit_log được commit dù business transaction có rollback
+protected void saveAuditLog(Auditable auditable, Object[] args) {
+    auditLogRepository.save(AuditLog.builder()...build());
+}
+```
+
+```
+REQUIRED (default):
+  Business Transaction ──────────────────────────────
+    └─ Audit (cùng transaction) ──
+  Nếu business rollback → audit cũng rollback → MẤT audit log!
+
+REQUIRES_NEW:
+  Business Transaction ──────────────────────────────
+  Audit Transaction (mới) ──  ← commit độc lập
+  Nếu business rollback → audit vẫn được commit ✅
+```
+
+**Ưu điểm AOP:**
+- Code sạch — không lẫn lộn logging/audit với business logic
+- Reusable — `@Auditable` dùng ở bất kỳ method nào
+- Không xâm phạm code gốc — thêm/xóa cross-cutting concern không sửa business code
+
+**Nhược điểm AOP:**
+- Khó debug — execution flow không tuyến tính
+- Performance overhead nhỏ của proxy (thường < 1ms, có thể bỏ qua)
+- `@Around` quên gọi `joinPoint.proceed()` → method không bao giờ chạy (subtle bug)
+- AOP chỉ hoạt động với Spring-managed beans, và chỉ qua Spring proxy (giống cache)
+
+---
+
+## 18. Apache Kafka — Event-Driven Architecture
+
+### 18.1 Tại sao cần Kafka?
+
+**Vấn đề với synchronous flow:**
+```
+Client → TaskService.updateTask() → gửi email notification
+                                  → gửi push notification
+                                  → cập nhật activity feed
+                                  → ...
+
+Response time = business logic + tất cả side effects
+Nếu email server chậm → cả request bị chậm
+Nếu notification service lỗi → update task cũng fail
+```
+
+**Giải pháp với Kafka:**
+```
+Client → TaskService.updateTask() → publish event → trả response ngay
+                    ↓
+              Kafka Topic "task-assigned"
+                    ↓
+         NotificationConsumer → tạo Notification (async)
+         EmailConsumer        → gửi email (async, service khác)
+         ActivityConsumer     → cập nhật feed (async, service khác)
+```
+
+**Decoupling** — TaskService không biết ai đang lắng nghe event. Thêm consumer mới không cần sửa producer.
+
+### 18.2 Kafka Concepts
+
+```
+Producer     → Gửi message vào Topic
+Topic        → Kênh phân loại message ("task-assigned", "task-completed")
+Partition    → Topic được chia thành nhiều partition → parallel processing
+Offset       → Vị trí của message trong partition (tăng dần, không thay đổi)
+Consumer     → Đọc message từ Topic
+ConsumerGroup→ Nhiều consumer cùng group → mỗi partition chỉ được đọc bởi 1 consumer
+Broker       → Kafka server lưu message
+```
+
+```
+Topic "task-assigned" với 3 partitions:
+  Partition 0: [msg0, msg3, msg6, ...]
+  Partition 1: [msg1, msg4, msg7, ...]
+  Partition 2: [msg2, msg5, msg8, ...]
+
+ConsumerGroup "taskflow-group" với 3 consumers:
+  Consumer A → đọc Partition 0
+  Consumer B → đọc Partition 1
+  Consumer C → đọc Partition 2
+  → 3x throughput so với 1 consumer
+```
+
+### 18.3 TaskFlow Kafka Design
+
+```java
+// Partition key = taskId → các event của cùng một task luôn vào cùng partition
+// → đảm bảo thứ tự xử lý cho một task cụ thể
+kafkaTemplate.send(topic, taskId.toString(), event);
+
+// Events là Java Records — immutable, serializable
+public record TaskAssignedEvent(
+    UUID taskId,
+    String taskTitle,
+    UUID projectId,
+    UUID assigneeId,
+    UUID assignedById,
+    LocalDateTime occurredAt  // Thời điểm event xảy ra (không phải lúc consume)
+) {}
+```
+
+**Event Design Best Practices trong TaskFlow:**
+- **Self-contained**: Event chứa đủ info để xử lý — không cần query thêm DB
+- **Immutable**: Records không thể thay đổi sau khi tạo
+- `occurredAt`: Phân biệt khi nào event xảy ra vs khi nào được xử lý
+
+### 18.4 Producer — Fire and Forget vs Confirmed
+
+```java
+// TaskFlow dùng async với callback (fire-and-forget với error logging)
+CompletableFuture<SendResult<String, Object>> future =
+    kafkaTemplate.send(topic, key, payload);
+
+future.whenComplete((result, ex) -> {
+    if (ex != null) {
+        log.error("Failed to send event: {}", ex.getMessage());
+        // Production: retry, dead letter queue, alert
+    } else {
+        log.debug("Sent offset={}", result.getRecordMetadata().offset());
+    }
+});
+```
+
+**3 mức độ delivery guarantee:**
+| Mode | Config | Đảm bảo | Performance |
+|------|--------|---------|-------------|
+| Fire & Forget | `acks=0` | Không đảm bảo | Nhanh nhất |
+| Leader Ack | `acks=1` | Leader nhận | Trung bình |
+| All Acks | `acks=all` | Tất cả replica | Chậm nhất, an toàn nhất |
+
+### 18.5 Consumer với Virtual Threads
+
+```java
+@KafkaListener(topics = KafkaConfig.TOPIC_TASK_ASSIGNED,
+               groupId = "${spring.kafka.consumer.group-id}")
+@Transactional
+public void onTaskAssigned(@Payload TaskAssignedEvent event) {
+    // Method này chạy trên Virtual Thread (spring.threads.virtual.enabled=true)
+    // I/O-bound: đọc DB (userRepository, taskRepository), ghi DB (notificationRepository)
+    // Virtual Thread xử lý tốt I/O blocking
+    userRepository.findById(event.assigneeId()).ifPresent(assignee -> {
+        notificationRepository.save(Notification.builder()...build());
+    });
+}
+```
+
+**Tại sao Consumer phù hợp với Virtual Threads?**
+Consumer chủ yếu làm I/O: đọc message từ Kafka → query DB → ghi DB. Mỗi bước đều là I/O blocking. Virtual Thread sẽ unmount khi block I/O, cho phép xử lý nhiều message song song mà không cần nhiều platform threads.
+
+### 18.6 At-Least-Once Delivery & Idempotency
+
+```
+Kafka đảm bảo At-Least-Once (ít nhất một lần):
+- Message KHÔNG bao giờ bị mất
+- Nhưng có thể được deliver nhiều lần (khi consumer crash trước khi commit offset)
+
+Ví dụ:
+  Consumer đọc message TaskAssigned → ghi Notification → crash TRƯỚC khi commit offset
+  → Kafka replay message → Consumer đọc lại → ghi Notification lần 2 → duplicate!
+
+Giải pháp (chưa implement trong MVP):
+  Option 1: Idempotent consumer — check trước khi insert
+    if (!notificationRepo.existsByTaskIdAndUserIdAndType(...)) {
+        notificationRepo.save(notification);
+    }
+  Option 2: Kafka transaction + Exactly-Once Semantics (EOS)
+```
+
+**Ưu điểm Kafka:**
+- Horizontal scale consumer dễ dàng — thêm instance, Kafka tự rebalance partition
+- Message persistence — lưu trữ lâu dài (configurable), replay được
+- Decoupling hoàn toàn giữa producer và consumer
+
+**Nhược điểm Kafka:**
+- Operational complexity cao — cần Zookeeper/KRaft, monitoring, tuning
+- Latency cao hơn direct call (thường 5-50ms overhead)
+- At-Least-Once → cần thiết kế consumer idempotent
+- Debugging distributed event flow khó hơn synchronous call
+
+---
+
 ## Tổng kết — Technology Decision Matrix
 
 | Kỹ thuật | Dùng khi | Không dùng khi |
@@ -1132,3 +1533,12 @@ page.isLast();           // Page cuối chưa?
 | Flyway | Mọi môi trường | Prototype/throwaway projects |
 | Custom Validator | Reusable business rule | One-off check trong service |
 | RFC 7807 | Public API | Internal tooling |
+| Redis Cache | Hot data, read-heavy | Data thay đổi mỗi request, cần consistency tuyệt đối |
+| `@Cacheable` | Idempotent read method | Method có side effect |
+| `@CacheEvict` | Sau mỗi write operation | — |
+| AOP `@Around` | Logging, audit, metrics | Business logic (dùng service thay vì) |
+| `@Auditable` | Reusable audit trail | One-off audit requirement |
+| `REQUIRES_NEW` transaction | Audit log, quan trọng không rollback | Cần chung transaction với caller |
+| Kafka | Async event, decoupled services | Simple notification, monolith nhỏ |
+| Kafka Records (event) | Event payload | Command (direct action) |
+| Virtual Threads | I/O-bound workload (Kafka consumer, API) | CPU-bound tasks |

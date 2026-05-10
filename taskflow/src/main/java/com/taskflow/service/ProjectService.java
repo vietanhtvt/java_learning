@@ -1,5 +1,7 @@
 package com.taskflow.service;
 
+import com.taskflow.aop.Auditable;
+import com.taskflow.config.RedisConfig;
 import com.taskflow.dto.request.AddMemberRequest;
 import com.taskflow.dto.request.CreateProjectRequest;
 import com.taskflow.dto.request.UpdateProjectRequest;
@@ -16,6 +18,9 @@ import com.taskflow.repository.ProjectRepository;
 import com.taskflow.repository.UserProjectRepository;
 import com.taskflow.repository.UserRepository;
 import lombok.RequiredArgsConstructor;
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.cache.annotation.Caching;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
@@ -37,6 +42,7 @@ public class ProjectService {
             .map(ProjectResponse::from);
     }
 
+    @Cacheable(value = RedisConfig.CACHE_PROJECTS, key = "#projectId")
     public ProjectResponse getProject(UUID projectId, UUID userId) {
         Project project = findProjectOrThrow(projectId);
         assertMember(projectId, userId);
@@ -44,6 +50,7 @@ public class ProjectService {
     }
 
     @Transactional
+    @Auditable(action = "CREATE_PROJECT")
     public ProjectResponse createProject(CreateProjectRequest request, UUID ownerId) {
         User owner = findUserOrThrow(ownerId);
 
@@ -67,6 +74,8 @@ public class ProjectService {
     }
 
     @Transactional
+    @Auditable(action = "UPDATE_PROJECT")
+    @CacheEvict(value = RedisConfig.CACHE_PROJECTS, key = "#projectId")
     public ProjectResponse updateProject(UUID projectId, UpdateProjectRequest request, UUID userId) {
         Project project = findProjectOrThrow(projectId);
         assertOwner(projectId, userId);
@@ -79,6 +88,8 @@ public class ProjectService {
     }
 
     @Transactional
+    @Auditable(action = "DELETE_PROJECT")
+    @CacheEvict(value = RedisConfig.CACHE_PROJECTS, key = "#projectId")
     public void deleteProject(UUID projectId, UUID userId) {
         findProjectOrThrow(projectId);
         assertOwner(projectId, userId);
@@ -86,6 +97,7 @@ public class ProjectService {
     }
 
     @Transactional
+    @CacheEvict(value = RedisConfig.CACHE_PROJECTS, key = "#projectId")
     public void addMember(UUID projectId, AddMemberRequest request, UUID requesterId) {
         findProjectOrThrow(projectId);
         assertOwner(projectId, requesterId);
@@ -106,6 +118,7 @@ public class ProjectService {
     }
 
     @Transactional
+    @CacheEvict(value = RedisConfig.CACHE_PROJECTS, key = "#projectId")
     public void removeMember(UUID projectId, UUID memberId, UUID requesterId) {
         findProjectOrThrow(projectId);
         assertOwner(projectId, requesterId);
