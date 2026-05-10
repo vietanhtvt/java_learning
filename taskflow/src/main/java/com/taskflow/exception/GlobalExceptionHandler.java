@@ -1,6 +1,7 @@
 package com.taskflow.exception;
 
 import org.springframework.http.*;
+import org.springframework.security.authentication.BadCredentialsException;
 import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -16,7 +17,7 @@ import java.util.Map;
 public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
 
     @ExceptionHandler(ResourceNotFoundException.class)
-    ProblemDetail handleResourceNotFound(ResourceNotFoundException ex, WebRequest request) {
+    ProblemDetail handleResourceNotFound(ResourceNotFoundException ex) {
         ProblemDetail problem = ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, ex.getMessage());
         problem.setTitle("Resource Not Found");
         problem.setType(URI.create("https://taskflow.api/errors/not-found"));
@@ -24,18 +25,34 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
     }
 
     @ExceptionHandler(AccessDeniedException.class)
-    ProblemDetail handleAccessDenied(AccessDeniedException ex, WebRequest request) {
+    ProblemDetail handleAccessDenied(AccessDeniedException ex) {
         ProblemDetail problem = ProblemDetail.forStatusAndDetail(HttpStatus.FORBIDDEN, ex.getMessage());
         problem.setTitle("Access Denied");
         problem.setType(URI.create("https://taskflow.api/errors/forbidden"));
         return problem;
     }
 
+    @ExceptionHandler(org.springframework.security.access.AccessDeniedException.class)
+    ProblemDetail handleSpringAccessDenied(org.springframework.security.access.AccessDeniedException ex) {
+        ProblemDetail problem = ProblemDetail.forStatusAndDetail(HttpStatus.FORBIDDEN, "Access denied");
+        problem.setTitle("Access Denied");
+        problem.setType(URI.create("https://taskflow.api/errors/forbidden"));
+        return problem;
+    }
+
     @ExceptionHandler(BusinessException.class)
-    ProblemDetail handleBusiness(BusinessException ex, WebRequest request) {
+    ProblemDetail handleBusiness(BusinessException ex) {
         ProblemDetail problem = ProblemDetail.forStatusAndDetail(ex.getStatus(), ex.getMessage());
         problem.setTitle("Business Rule Violation");
         problem.setType(URI.create("https://taskflow.api/errors/business"));
+        return problem;
+    }
+
+    @ExceptionHandler(BadCredentialsException.class)
+    ProblemDetail handleBadCredentials(BadCredentialsException ex) {
+        ProblemDetail problem = ProblemDetail.forStatusAndDetail(HttpStatus.UNAUTHORIZED, "Invalid credentials");
+        problem.setTitle("Authentication Failed");
+        problem.setType(URI.create("https://taskflow.api/errors/unauthorized"));
         return problem;
     }
 
@@ -61,7 +78,8 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
     }
 
     @ExceptionHandler(Exception.class)
-    ProblemDetail handleGeneral(Exception ex, WebRequest request) {
+    ProblemDetail handleGeneral(Exception ex) {
+        logger.error("Unexpected error", ex);
         ProblemDetail problem = ProblemDetail.forStatusAndDetail(
             HttpStatus.INTERNAL_SERVER_ERROR, "An unexpected error occurred");
         problem.setTitle("Internal Server Error");
