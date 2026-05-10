@@ -1,0 +1,64 @@
+{
+  "project": "TaskFlow API",
+  "start_date": "2026-05-10",
+  "deadline": "2026-05-14",
+  "sessions": {
+    "S1": {
+      "date": "2026-05-10",
+      "time": "morning",
+      "title": "Project bootstrap, entities, Flyway",
+      "status": "pending",
+      "completed_tasks": []
+    },
+    "S2": {
+      "date": "2026-05-10",
+      "time": "afternoon",
+      "title": "Task/Comment domain, CRUD APIs",
+      "status": "pending",
+      "completed_tasks": []
+    },
+    "S3": {
+      "date": "2026-05-11",
+      "time": "morning",
+      "title": "Spring Security + JWT",
+      "status": "pending",
+      "completed_tasks": []
+    },
+    "S4": {
+      "date": "2026-05-11",
+      "time": "afternoon",
+      "title": "Exception handling, Validation, Pagination",
+      "status": "pending",
+      "completed_tasks": []
+    },
+    "S5": {
+      "date": "2026-05-12",
+      "time": "morning",
+      "title": "Redis Cache + AOP Logging",
+      "status": "pending",
+      "completed_tasks": []
+    },
+    "S6": {
+      "date": "2026-05-12",
+      "time": "afternoon",
+      "title": "Kafka Events + Notifications + Virtual Threads",
+      "status": "pending",
+      "completed_tasks": []
+    },
+    "S7": {
+      "date": "2026-05-13",
+      "time": "morning",
+      "title": "Testing (JUnit5 + Testcontainers)",
+      "status": "pending",
+      "completed_tasks": []
+    },
+    "S8": {
+      "date": "2026-05-13",
+      "time": "afternoon",
+      "title": "Docker Compose + CI/CD + Actuator",
+      "status": "pending",
+      "completed_tasks": []
+    }
+  },
+  "notes": ""
+}
