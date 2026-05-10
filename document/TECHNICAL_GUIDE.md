@@ -1,6 +1,8 @@
 # TaskFlow API — Hướng Dẫn Kỹ Thuật Chi Tiết
 
 > Tài liệu giải thích toàn bộ kỹ thuật được áp dụng trong dự án, kèm ưu/nhược điểm và lý do lựa chọn.
+>
+> 📘 **Xem thêm:** [`SENIOR_ROADMAP.md`](./SENIOR_ROADMAP.md) — kế hoạch nâng cấp lên senior production-grade (Resilience4j, Outbox Pattern, Distributed Tracing, Hexagonal Architecture, Kubernetes...).
 
 ---
 
