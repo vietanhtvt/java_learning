@@ -1,0 +1,283 @@
+{
+  "project": "TaskFlow API — Senior Upgrade",
+  "start_date": "2026-05-11",
+  "current_phase": 1,
+  "current_session": "S1",
+  "overall_progress_percent": 0,
+  "phases": {
+    "phase1_performance": {
+      "name": "Performance Hardening",
+      "weeks": "1-2",
+      "status": "in_progress",
+      "sessions": {
+        "S1": {
+          "title": "@Version + Flyway Migration",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        },
+        "S2": {
+          "title": "EntityGraph Optimization",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        },
+        "S3": {
+          "title": "DTO Projection (TaskListItem, TaskBoardView)",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        },
+        "S4": {
+          "title": "Composite Indexes (Flyway V4)",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        },
+        "S5": {
+          "title": "HikariCP Production Tuning",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        },
+        "S6": {
+          "title": "N+1 Tests + Exception Handler",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        }
+      }
+    },
+    "phase2_resilience": {
+      "name": "Resilience & Reliability",
+      "weeks": "3-4",
+      "status": "not_started",
+      "sessions": {
+        "S7": {
+          "title": "Resilience4j Circuit Breaker",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        },
+        "S8": {
+          "title": "Retry + Bulkhead",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        },
+        "S9": {
+          "title": "Outbox Table + Entity",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        },
+        "S10": {
+          "title": "OutboxPoller + Refactor NotificationProducer",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        },
+        "S11": {
+          "title": "Idempotency Keys",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        },
+        "S12": {
+          "title": "Graceful Shutdown + Redisson",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        }
+      }
+    },
+    "phase3_observability": {
+      "name": "Observability",
+      "weeks": "5-6",
+      "status": "not_started",
+      "sessions": {
+        "S13": {
+          "title": "Distributed Tracing Setup (Micrometer + OTel + Jaeger)",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        },
+        "S14": {
+          "title": "Custom Spans in Services",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        },
+        "S15": {
+          "title": "MDC Filter + JSON Logging",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        },
+        "S16": {
+          "title": "Custom Health Indicators + Liveness/Readiness",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        }
+      }
+    },
+    "phase4_security": {
+      "name": "Security Hardening",
+      "weeks": "7-8",
+      "status": "not_started",
+      "sessions": {
+        "S17": {
+          "title": "Rate Limiting (Bucket4j + Redis)",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        },
+        "S18": {
+          "title": "Tier-based Rate Limiting",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        },
+        "S19": {
+          "title": "HTTP Security Headers",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        },
+        "S20": {
+          "title": "Encryption at Rest (AES-256-GCM)",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        },
+        "S21": {
+          "title": "Spring Cloud Vault",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        }
+      }
+    },
+    "phase5_architecture": {
+      "name": "Architecture Refactoring",
+      "weeks": "9-10",
+      "status": "not_started",
+      "sessions": {
+        "S22": {
+          "title": "ArchUnit Tests",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        },
+        "S23": {
+          "title": "Hexagonal - Domain Layer",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        },
+        "S24": {
+          "title": "Hexagonal - Ports (In/Out)",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        },
+        "S25": {
+          "title": "Hexagonal - JPA Adapter + Mapper",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        },
+        "S26": {
+          "title": "Hexagonal - REST Adapter",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        },
+        "S27": {
+          "title": "CQRS Query Side (JdbcTemplate)",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        },
+        "S28": {
+          "title": "API Versioning (/api/v1/)",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        }
+      }
+    },
+    "phase6_devops": {
+      "name": "Testing + DevOps",
+      "weeks": "11-12",
+      "status": "not_started",
+      "sessions": {
+        "S29": {
+          "title": "Pitest Mutation Testing Setup",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        },
+        "S30": {
+          "title": "Fix Weak Tests (Pitest Report)",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        },
+        "S31": {
+          "title": "Pact Contract Testing",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        },
+        "S32": {
+          "title": "k6 Load Testing",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        },
+        "S33": {
+          "title": "Helm Chart (Chart.yaml + deployment template)",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        },
+        "S34": {
+          "title": "K8s HPA + PDB + Ingress",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        },
+        "S35": {
+          "title": "Argo Rollouts Canary Config",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        },
+        "S36": {
+          "title": "JVM Tuning + Chaos Monkey",
+          "status": "pending",
+          "completed_tasks": [],
+          "notes": ""
+        }
+      }
+    }
+  },
+  "tech_versions": {
+    "spring_boot": "3.5.x",
+    "java": "21",
+    "postgresql": "17",
+    "redis": "7.4",
+    "kafka": "3.9",
+    "resilience4j": "2.2.x",
+    "bucket4j": "8.10.x",
+    "redisson": "3.36.x",
+    "micrometer_tracing": "1.4.x",
+    "opentelemetry": "2.x",
+    "archunit": "1.4.x",
+    "pitest": "1.17.x"
+  },
+  "notes": "Senior upgrade started 11/5/2026. MVP completed 10/5/2026 with 8 sessions.",
+  "last_updated": "2026-05-11"
+}
