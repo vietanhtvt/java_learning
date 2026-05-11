@@ -1,64 +1,66 @@
 {
   "project": "TaskFlow API",
-  "start_date": "2026-05-10",
+  "start_date": "2026-05-11",
   "deadline": "2026-05-14",
+  "tech_stack": "Java 21, Spring Boot 3.3, PostgreSQL, Redis, Kafka, Docker, GitHub Actions",
+  "scaffold_status": "EXISTS — src/ already has entity/service/controller/security/kafka/test scaffold",
   "sessions": {
     "S1": {
-      "date": "2026-05-10",
+      "date": "2026-05-11",
       "time": "morning",
-      "title": "Project bootstrap, entities, Flyway",
+      "title": "Verify Foundation: compile, entities, Flyway",
       "status": "pending",
       "completed_tasks": []
     },
     "S2": {
-      "date": "2026-05-10",
+      "date": "2026-05-11",
       "time": "afternoon",
-      "title": "Task/Comment domain, CRUD APIs",
+      "title": "CRUD APIs: Task, Project, Comment controllers",
       "status": "pending",
       "completed_tasks": []
     },
     "S3": {
-      "date": "2026-05-11",
+      "date": "2026-05-12",
       "time": "morning",
-      "title": "Spring Security + JWT",
+      "title": "Spring Security + JWT auth flow",
       "status": "pending",
       "completed_tasks": []
     },
     "S4": {
-      "date": "2026-05-11",
+      "date": "2026-05-12",
       "time": "afternoon",
       "title": "Exception handling, Validation, Pagination",
       "status": "pending",
       "completed_tasks": []
     },
     "S5": {
-      "date": "2026-05-12",
+      "date": "2026-05-13",
       "time": "morning",
-      "title": "Redis Cache + AOP Logging",
+      "title": "Redis Cache + AOP Logging + Virtual Threads",
       "status": "pending",
       "completed_tasks": []
     },
     "S6": {
-      "date": "2026-05-12",
+      "date": "2026-05-13",
       "time": "afternoon",
-      "title": "Kafka Events + Notifications + Virtual Threads",
+      "title": "Kafka Events + Notification flow",
       "status": "pending",
       "completed_tasks": []
     },
     "S7": {
-      "date": "2026-05-13",
+      "date": "2026-05-14",
       "time": "morning",
-      "title": "Testing (JUnit5 + Testcontainers)",
+      "title": "Testing: JUnit5, MockMvc, Testcontainers",
       "status": "pending",
       "completed_tasks": []
     },
     "S8": {
-      "date": "2026-05-13",
+      "date": "2026-05-14",
       "time": "afternoon",
-      "title": "Docker Compose + CI/CD + Actuator",
+      "title": "Docker Compose + CI/CD + Actuator + Final README",
       "status": "pending",
       "completed_tasks": []
     }
   },
-  "notes": ""
+  "notes": "Revised from 10/5 start to 11/5. Scaffold code exists in taskflow/src — sessions focus on VERIFY + COMPLETE + TEST, not greenfield."
 }
