@@ -11,6 +11,7 @@ import com.taskflow.kafka.NotificationProducer;
 import com.taskflow.kafka.event.TaskAssignedEvent;
 import com.taskflow.kafka.event.TaskCompletedEvent;
 import com.taskflow.repository.*;
+import io.micrometer.core.instrument.Counter;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -39,6 +40,8 @@ class TaskServiceTest {
     @Mock UserRepository userRepository;
     @Mock LabelRepository labelRepository;
     @Mock NotificationProducer notificationProducer;
+    @Mock Counter taskCreatedCounter;
+    @Mock Counter taskCompletedCounter;
 
     @InjectMocks TaskService taskService;
 
