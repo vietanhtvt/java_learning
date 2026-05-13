@@ -61,11 +61,23 @@
 31. [Blue/Green & Canary Deployment](#31-bluegreen--canary)
 32. [JVM Tuning & GC Selection (G1 vs ZGC)](#32-jvm-tuning--gc)
 
+#### B.8 — Modern Java & Advanced Patterns
+33. [Virtual Threads (Project Loom) — Java 21](#33-virtual-threads-project-loom--java-21)
+34. [GraalVM Native Image — Cold Start & Memory](#34-graalvm-native-image--cold-start--memory)
+35. [Saga Pattern — Distributed Transactions](#35-saga-pattern--distributed-transactions)
+36. [Caching Strategies — 4 Patterns](#36-caching-strategies--4-patterns)
+37. [Dead Letter Queue & Retry Topics (Kafka)](#37-dead-letter-queue--retry-topics-kafka)
+38. [Database Sharding & Partitioning](#38-database-sharding--partitioning)
+39. [Multi-tenancy Strategies](#39-multi-tenancy-strategies)
+40. [API Gateway & BFF Pattern](#40-api-gateway--bff-pattern)
+41. [Domain Events vs Integration Events](#41-domain-events-vs-integration-events)
+42. [Reactive Programming — WebFlux & R2DBC](#42-reactive-programming--webflux--r2dbc)
+
 ### Phần C — Roadmap Triển khai
 
-33. [Roadmap 6 Phase (12 tuần)](#33-roadmap-6-phase-12-tuần)
-34. [Effort Estimation Matrix](#34-effort-estimation-matrix)
-35. [Quick-win priorities (làm trước)](#35-quick-win-priorities)
+43. [Roadmap 6 Phase (12 tuần)](#43-roadmap-6-phase-12-tuần)
+44. [Effort Estimation Matrix](#44-effort-estimation-matrix)
+45. [Quick-win priorities (làm trước)](#45-quick-win-priorities)
 
 ---
 
@@ -207,14 +219,20 @@ void shouldNotHaveNPlusOne() {
 
 ### Vấn đề: Lost Update
 
+Không có lock → 2 user cùng update → 1 update bị nuốt:
+
 ```
-T0: User A đọc Task#1 (status=TODO, version=5)
-T0: User B đọc Task#1 (status=TODO, version=5)
-T1: User A đổi status=IN_PROGRESS, save → version=6 ✓
-T2: User B đổi status=DONE, save → version=6 (overwrite A's change!) ✗
+Time   User A                    DB (Task#1)              User B
+─────────────────────────────────────────────────────────────────
+T0     SELECT  ─────────►   status=TODO, v=5
+T0                          status=TODO, v=5    ◄───── SELECT
+T1     local: TODO→DOING                       local: TODO→DONE
+T2     UPDATE ─────────►    status=DOING, v=6
+T3                          status=DONE, v=7    ◄───── UPDATE  ✗
+                            (A's change LOST!)
 ```
 
-User A's change bị mất hoàn toàn → **Lost Update Anomaly**.
+User A's change bị nuốt hoàn toàn → **Lost Update Anomaly**.
 
 ### Giải pháp: `@Version`
 
@@ -231,6 +249,30 @@ Hibernate tự động:
 1. Mỗi UPDATE: `WHERE id = ? AND version = ?`
 2. Increment version sau mỗi save thành công
 3. Throw `OptimisticLockException` nếu version mismatch
+
+### Sequence với @Version — Conflict được detect
+
+```
+Time   User A                       DB (Task#1)                    User B
+──────────────────────────────────────────────────────────────────────────
+T0     SELECT ─────────►       id=1, status=TODO, v=5
+T0                              id=1, status=TODO, v=5   ◄────── SELECT
+T1     UPDATE WHERE id=1
+         AND version=5 ─────►   ✓ matched → v=6, status=DOING
+T2                              UPDATE WHERE id=1
+                                  AND version=5         ◄────── 0 rows affected
+T3                              Hibernate throws         ─────► OptimisticLockException
+T4                              ← retry: SELECT (v=6, status=DOING) → merge → UPDATE OK
+```
+
+→ Hibernate generate SQL:
+
+```sql
+UPDATE tasks SET status='DOING', version=6
+WHERE id=1 AND version=5;     -- WHERE version=? là CORE của optimistic lock
+
+-- Nếu rows affected = 0 → ai đó đã update trước → throw exception
+```
 
 ### Xử lý exception
 
@@ -492,10 +534,33 @@ resilience4j:
         permitted-number-of-calls-in-half-open-state: 3
 ```
 
-**3 trạng thái:**
-- `CLOSED`: requests đi qua bình thường
-- `OPEN`: requests fail ngay (không call downstream) — protect downstream
-- `HALF_OPEN`: thử vài request để test recovery
+**3 trạng thái + state machine:**
+
+```
+                ┌─────────────────────────────────────────┐
+                │                                         │
+                │     fail rate < threshold               │
+                │                                         │
+        ┌───────▼────────┐                       ┌────────┴────────┐
+        │     CLOSED     │  fail rate ≥ 50%      │      OPEN       │
+        │ (normal calls) ├──────────────────────►│ (fail fast: no  │
+        │                │                       │  downstream     │
+        │ count failures │                       │  calls allowed) │
+        └───────▲────────┘                       └────────┬────────┘
+                │                                         │
+                │  N test calls all OK                    │ wait-duration
+                │                                         │ (30s)
+                │                                         ▼
+                │                                ┌─────────────────┐
+                │   any test call fails          │   HALF_OPEN     │
+                └────────────────────────────────┤ (probe: allow 3 │
+                                                 │  test calls)    │
+                                                 └─────────────────┘
+```
+
+- `CLOSED`: requests đi qua bình thường, đếm failure rate trong sliding window
+- `OPEN`: requests fail ngay không gọi downstream → protect downstream khỏi cascading failure
+- `HALF_OPEN`: sau wait-duration, cho qua `permitted-number-of-calls` để test → tất cả OK thì CLOSED, có fail thì quay lại OPEN
 
 ### Pattern 2: Retry với Exponential Backoff
 
@@ -597,6 +662,38 @@ CREATE TABLE outbox (
 
 3. Nếu Kafka down: event vẫn ở outbox → retry sau
 ```
+
+### Kiến trúc tổng thể
+
+```
+        ┌──────────────────────────────────────────────────────────┐
+        │                  Service.createTask()                    │
+        │                                                          │
+        │   ┌──────────────────────────────────────┐               │
+        │   │           ONE Database Tx            │               │
+        │   │  ┌─────────────┐   ┌─────────────┐   │               │
+        │   │  │   tasks     │   │   outbox    │   │               │
+        │   │  │ INSERT row  │   │ INSERT row  │   │               │
+        │   │  └─────────────┘   └─────────────┘   │               │
+        │   │         ATOMIC COMMIT                │               │
+        │   └──────────────────────────────────────┘               │
+        └─────────────────────┬────────────────────────────────────┘
+                              │ (data persisted)
+                              ▼
+        ┌──────────────────────────────────────────────────────────┐
+        │   OutboxPoller (or Debezium CDC reading WAL)             │
+        │   - polls/streams unpublished rows every 1s              │
+        │   - sends to Kafka                                       │
+        │   - marks row as published                               │
+        │   - retries on failure (event NEVER lost)                │
+        └─────────────────────┬────────────────────────────────────┘
+                              ▼
+                          ┌────────┐
+                          │ Kafka  │ ──► Consumers (email, slack, audit...)
+                          └────────┘
+```
+
+→ Key insight: **DB transaction guarantees** rằng `task` và `outbox` được tạo cùng lúc. Không có "task created but event lost" possibility nữa.
 
 ### Implementation
 
@@ -938,6 +1035,37 @@ Producer span:  [HTTP /api/tasks (200ms)]
 ```
 
 Trên Jaeger UI thấy ngay flow này.
+
+### Cấu trúc Trace, Span, Context
+
+```
+TRACE (1 request end-to-end) — TraceID: abc123
+│
+├── SPAN A: HTTP POST /api/tasks      [parent=null, 200ms]
+│   │
+│   ├── SPAN B: TaskService.create   [parent=A, 180ms]
+│   │   ├── SPAN C: DB INSERT        [parent=B, 15ms]
+│   │   └── SPAN D: Kafka send       [parent=B, 5ms]   ──┐
+│   │                                                    │  context propagated
+│   └── SPAN E: HTTP response        [parent=A, 2ms]     │  via 'traceparent'
+│                                                        │  Kafka header
+└── SPAN F: NotificationConsumer    [parent=D, 320ms] ◄──┘
+    ├── SPAN G: DB INSERT notif      [parent=F, 10ms]
+    └── SPAN H: Email SMTP send      [parent=F, 300ms]  ← bottleneck visible
+```
+
+W3C Trace Context HTTP header format:
+
+```
+traceparent: 00-abc123def456789a-0011223344556677-01
+              │   │                │                │
+              │   │                │                └── flags (01 = sampled)
+              │   │                └── parent span ID
+              │   └── trace ID (128 bit)
+              └── version
+```
+
+→ Mọi service trên trace chain inject header này → backend (Jaeger/Tempo/Datadog) reassemble thành tree view.
 
 ---
 
@@ -1966,6 +2094,54 @@ spec:
 
 ## 32. JVM Tuning & GC
 
+### JVM Memory Layout
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                      JVM Process Memory                        │
+│                                                                │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                       HEAP                               │  │
+│  │  ┌────────────────────┐  ┌────────────────────────────┐  │  │
+│  │  │  Young Generation  │  │      Old Generation        │  │  │
+│  │  │ ┌────┬─────┬─────┐ │  │  (long-lived objects,      │  │  │
+│  │  │ │Eden│ S0  │ S1  │ │  │   cache entries, beans)    │  │  │
+│  │  │ └────┴─────┴─────┘ │  │                            │  │  │
+│  │  │ (new allocations)  │  │  Promoted from Young after │  │  │
+│  │  │                    │  │  ~15 GC survivals          │  │  │
+│  │  └────────────────────┘  └────────────────────────────┘  │  │
+│  │     Minor GC (fast)            Major/Full GC (slow!)     │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                                │
+│  ┌──────────────────────┐  ┌──────────────────────────────┐    │
+│  │     Metaspace        │  │    Direct Memory (Off-heap)  │    │
+│  │ (Class metadata,     │  │  - NIO ByteBuffers           │    │
+│  │  reflection data)    │  │  - Netty pools               │    │
+│  │ Off-heap, native     │  │  - Lucene/Elasticsearch      │    │
+│  └──────────────────────┘  └──────────────────────────────┘    │
+│                                                                │
+│  ┌──────────────────────┐  ┌──────────────────────────────┐    │
+│  │     Thread Stacks    │  │      Code Cache              │    │
+│  │ (1MB × N threads)    │  │  (JIT compiled native code)  │    │
+│  └──────────────────────┘  └──────────────────────────────┘    │
+└────────────────────────────────────────────────────────────────┘
+```
+
+**Lifecycle của object:**
+```
+new Task()  →  Eden  →[minor GC]→  S0  →[minor GC]→  S1  →[after ~15 cycles]→  Old Gen
+```
+
+### So sánh các GC algorithms
+
+| GC | Pause time | Throughput | Heap size | Khi nào dùng |
+|----|-----------|------------|-----------|--------------|
+| **Serial GC** | Cao (>500ms) | Cao single-thread | <100MB | Embedded, dev |
+| **Parallel GC** | Cao (~500ms) | Cao nhất | <8GB | Batch jobs |
+| **G1GC** (default Java 21) | ~200ms | Tốt | 4-32GB | General web apps |
+| **ZGC** | <1ms | Vừa | 8GB-16TB | Low-latency apps |
+| **Shenandoah** | <10ms | Vừa | 4-100GB | Low-latency, RedHat |
+
 ### Spring Boot 3 + Java 21 default
 
 - GC: G1GC (general-purpose)
@@ -2022,9 +2198,777 @@ jvm.threads.peak       — thread peak (detect leak)
 
 ---
 
+# B.8 Modern Java & Advanced Patterns
+
+## 33. Virtual Threads (Project Loom) — Java 21
+
+### Vấn đề: Platform Thread Cost
+
+Mỗi platform thread = 1 OS thread = ~1MB stack memory. Tomcat default `maxThreads=200` → 200MB cho thread alone. Server với traffic cao (10K concurrent connections) **không thể** dùng "thread-per-request" model vì OOM.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│   Traditional: Platform Threads (1 thread = 1 OS thread)    │
+│                                                             │
+│   Request → ┌──────────┐ ── OS Thread A (1MB) ── blocked    │
+│             │  Tomcat  │      on JDBC call (sleeping)       │
+│   Request → │  Thread  │ ── OS Thread B (1MB) ── blocked    │
+│             │  Pool    │      on HTTP call                  │
+│   Request → └──────────┘ ── OS Thread C (1MB) ── busy CPU   │
+│                                                             │
+│   10K connections × 1MB = 10GB RAM JUST FOR THREADS!        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Giải pháp: Virtual Threads
+
+Virtual thread = lightweight Java thread (vài KB) được mount lên **carrier platform thread** chỉ khi thực thi CPU work. Khi block (I/O, sleep, synchronized) → JVM unmount, carrier thread tự do phục vụ virtual thread khác.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Virtual Threads (Java 21+)                                     │
+│                                                                 │
+│  100K Virtual ───┐                                              │
+│  Threads (each   │     ┌─────── Carrier Pool ───────┐           │
+│  vài KB)         ├────►│ OS Thread 1 ◄── Mounted    │           │
+│                  │     │ OS Thread 2 ◄── VT-A       │           │
+│  When VT blocks  │     │ OS Thread 3 ◄── VT-B       │           │
+│  on I/O → unmount│     │ ... (≈ #cores)             │           │
+│  carrier is free │     └────────────────────────────┘           │
+│  for another VT  │                                              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Enable trong Spring Boot 3.2+
+
+```yaml
+spring:
+  threads:
+    virtual:
+      enabled: true     # Tomcat dùng VT cho request, @Async dùng VT
+```
+
+Hoặc programmatic:
+```java
+@Bean
+public TomcatProtocolHandlerCustomizer<?> protocolHandlerVirtualThreadExecutor() {
+    return protocol -> protocol.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
+}
+```
+
+### Pitfalls — khi KHÔNG dùng VT
+
+1. **CPU-bound work** (image processing, compression): VT không giúp; dùng ForkJoinPool.
+2. **synchronized blocks pinning**: VT bị "pin" vào carrier khi vào `synchronized` → carrier không thể serve VT khác → nullify VT advantage. **Migrate sang `ReentrantLock`.**
+3. **ThreadLocal abuse**: VT có thể có 1M instance → ThreadLocal x 1M = OOM. Dùng `ScopedValue` (Java 21 preview) thay thế.
+4. **Connection pool sizing**: Pool nhỏ vẫn là bottleneck. VT không giúp tăng DB capacity; cần tăng pool hoặc dùng async DB driver.
+
+```java
+// BAD - pin VT vào carrier
+synchronized(lock) {
+    dbCall();    // I/O sẽ pin carrier
+}
+
+// GOOD - ReentrantLock không pin
+lock.lock();
+try { dbCall(); } finally { lock.unlock(); }
+```
+
+### Detect Pinning
+
+```bash
+java -Djdk.tracePinnedThreads=full -jar app.jar
+```
+
+Output:
+```
+Thread[VirtualThread[#42],main] reason: pinned 0 ms
+    java.base/java.lang.Object.wait(Object.java:...)   ← problematic
+```
+
+---
+
+## 34. GraalVM Native Image — Cold Start & Memory
+
+### Vấn đề
+
+Spring Boot trên JVM:
+- Cold start: 3-5s (load classes, JIT warmup)
+- Memory: 300-500MB baseline
+
+Serverless (AWS Lambda, Cloud Run): cold start mỗi invocation → user latency spike + chi phí cao.
+
+### GraalVM Native Image
+
+Compile Java bytecode → **native executable** tại build time (AOT - Ahead Of Time):
+
+```
+Build time:                      Runtime:
+┌─────────────────┐              ┌─────────────────┐
+│ .java + .jar    │              │  native binary  │
+│ (Spring beans,  │  GraalVM     │  - 50ms start   │
+│  dependencies,  │ ───────────► │  - 50MB memory  │
+│  reflection     │   native-    │  - No JIT       │
+│  metadata)      │   image      │  - No GC tuning │
+└─────────────────┘              └─────────────────┘
+```
+
+### Spring Boot 3 hỗ trợ sẵn
+
+```bash
+./mvnw native:compile -Pnative
+./target/taskflow
+# Startup: 0.05s vs 3s JVM
+```
+
+### Trade-offs
+
+| Aspect | JVM | Native |
+|--------|-----|--------|
+| Cold start | 3-5s | 50ms |
+| Memory | 400MB | 80MB |
+| Peak throughput | Cao (JIT optimize) | Thấp hơn 10-20% |
+| Build time | 30s | 5-10 phút |
+| Binary size | ~50MB | ~80MB |
+| Reflection | Free | Phải khai báo metadata |
+| Dynamic class load | Free | Không cho phép |
+
+### Reflection Hints (cho thư viện ngoài Spring)
+
+```java
+@RegisterReflectionForBinding({MyDto.class, MyEvent.class})
+@Configuration
+public class NativeConfig { }
+```
+
+→ Production rule: **Dùng native cho serverless, Lambda, CLI tools.** Server-side với traffic cao dùng JVM vẫn tốt hơn (throughput).
+
+---
+
+## 35. Saga Pattern — Distributed Transactions
+
+### Vấn đề: 2PC không scale
+
+Khi 1 use case touch nhiều service (Order → Payment → Inventory → Shipping), traditional 2-Phase Commit:
+- Locks across services suốt thời gian commit → throughput thấp
+- Coordinator chết → resource locked forever
+- Không phù hợp với eventual consistency của microservices
+
+### Saga = chuỗi local transactions + compensating actions
+
+**Hai flavors:**
+
+#### Choreography Saga (event-driven, no central coordinator)
+
+```
+┌──────────┐                            ┌──────────┐
+│ Order    │── OrderCreated event ────►│ Payment  │
+│ Service  │                            │ Service  │
+└──────────┘                            └────┬─────┘
+     ▲                                       │
+     │                                       │ PaymentCompleted
+     │ ShippingFailed                        ▼
+     │ → cancel order               ┌──────────────┐
+     │ + refund                     │  Inventory   │
+     │                              │  Service     │
+     │                              └──────┬───────┘
+     │                                     │ InventoryReserved
+     │                                     ▼
+     │                              ┌──────────────┐
+     └──────────────────────────────│  Shipping    │
+                                    │  Service     │
+                                    └──────────────┘
+```
+
+**Mỗi service:**
+- React tới event upstream
+- Execute local TX
+- Publish event downstream
+- On failure → publish compensating event ngược chiều
+
+#### Orchestration Saga (central coordinator)
+
+```
+                  ┌────────────────────────┐
+                  │   Saga Orchestrator    │
+                  │   (state machine)      │
+                  └──┬──────┬───────┬──────┘
+                     │      │       │
+              cmd:   │  cmd:│   cmd:│
+              charge │ reserve│  ship│
+                     ▼      ▼       ▼
+                  ┌─────┐ ┌─────┐ ┌──────┐
+                  │ Pay │ │ Inv │ │ Ship │
+                  └──┬──┘ └──┬──┘ └──┬───┘
+                     │       │       │
+              reply: │  reply:│  reply:
+              charged│reserved│ shipped
+                     ▼       ▼       ▼
+                  ┌─────────────────────┐
+                  │   Orchestrator      │
+                  │   (next step or     │
+                  │    compensate)      │
+                  └─────────────────────┘
+```
+
+### Compensating Transaction
+
+Mỗi step có "undo" tương ứng (KHÔNG phải DB rollback, là **business action ngược lại**):
+
+| Forward action       | Compensation                  |
+|----------------------|-------------------------------|
+| `chargePayment()`    | `refundPayment()`             |
+| `reserveInventory()` | `releaseInventory()`          |
+| `bookShipping()`     | `cancelShipping()`            |
+| `sendEmail()`        | `sendCancellationEmail()` (không "unsend" được) |
+
+### So sánh
+
+| Aspect | Choreography | Orchestration |
+|--------|--------------|---------------|
+| Coupling | Lỏng (event-based) | Tight với orchestrator |
+| Visibility | Khó debug (logic phân tán) | Dễ trace flow |
+| Scaling | Service độc lập | Orchestrator có thể bottleneck |
+| Use when | 2-4 services đơn giản | Workflow phức tạp, conditional |
+
+Tools: Camunda, Temporal, AWS Step Functions, Axon Framework.
+
+---
+
+## 36. Caching Strategies — 4 Patterns
+
+### Pattern 1: Cache-Aside (Lazy Loading) — phổ biến nhất
+
+```
+   Read flow:                   Write flow:
+   ┌──────┐                     ┌──────┐
+   │ App  │                     │ App  │
+   └──┬───┘                     └──┬───┘
+      │ 1. GET key                 │ 1. UPDATE row
+      ▼                            ▼
+   ┌──────┐                     ┌──────┐
+   │Cache │ miss?               │  DB  │
+   └──┬───┘                     └──────┘
+      │ 2. SELECT                  │
+      ▼                            │ 2. DELETE/INVALIDATE key
+   ┌──────┐                        ▼
+   │  DB  │ → return value      ┌──────┐
+   └──────┘                     │Cache │
+      ▲                         └──────┘
+      │ 3. SET key into cache
+```
+
+```java
+public Task getTask(UUID id) {
+    Task cached = cache.get("task:" + id);
+    if (cached != null) return cached;
+    Task task = db.findById(id);
+    cache.put("task:" + id, task);
+    return task;
+}
+```
+
+→ App điều khiển cache. DB là source of truth. Cache không "consistent" với DB ngay tức thì.
+
+### Pattern 2: Read-Through (cache library handles miss)
+
+```
+   App ──► Cache library ──► DB (on miss)
+                   ▲
+                   └── library tự fill cache
+```
+
+Cache library (Caffeine LoadingCache, Redisson MapCache) tự load DB khi miss → app không cần biết:
+
+```java
+LoadingCache<UUID, Task> cache = Caffeine.newBuilder()
+    .expireAfterWrite(10, TimeUnit.MINUTES)
+    .build(id -> taskRepository.findById(id).orElseThrow());
+
+Task t = cache.get(id);   // tự load nếu miss
+```
+
+### Pattern 3: Write-Through (đồng bộ write cache + DB)
+
+```
+   App ──► Cache ──► DB
+              │
+              └── đồng thời update cache (synchronous)
+```
+
+Write luôn đi qua cache → cache luôn fresh. Trade-off: write latency tăng (đi qua 2 hop).
+
+### Pattern 4: Write-Behind (Write-Back)
+
+```
+   App ──► Cache ──► (return immediately)
+              │
+              └─── async flush DB in batch
+```
+
+Write rất nhanh (chỉ ghi cache) → cache batch flush DB. Risk: cache chết → mất data chưa flush.
+
+### Comparison
+
+| Pattern | Consistency | Write latency | Read latency | Risk |
+|---------|-------------|---------------|--------------|------|
+| Cache-Aside | Eventual (stale ok) | Normal | Fast on hit | App phải invalidate đúng |
+| Read-Through | Same as aside | Normal | Fast on hit | Cache là SPOF |
+| Write-Through | Strong | Slow (2 hop) | Fast | Cache là SPOF |
+| Write-Behind | Eventual (lost-write risk) | Fast | Fast | Mất data nếu cache crash |
+
+**Production rule:** Default dùng **Cache-Aside với TTL ngắn**. Chỉ chuyển sang Write-Through khi cần strong consistency, Write-Behind khi cần extreme write throughput (analytics).
+
+---
+
+## 37. Dead Letter Queue & Retry Topics (Kafka)
+
+### Vấn đề: Poison Message
+
+Một message bị malformed → consumer throw exception → commit fail → consumer **re-poll cùng message** → infinite loop, lag tăng vô tận.
+
+### Solution: Retry topic + DLQ
+
+```
+                    ┌────────────────────────────┐
+                    │  Original Topic: orders    │
+                    └─────────────┬──────────────┘
+                                  │ consume
+                                  ▼
+                          ┌───────────────┐
+                          │   Consumer    │
+                          └───┬───────────┘
+                              │
+                  success ────┘    ────── exception
+                                          │
+                                          ▼
+                              ┌───────────────────────┐
+                              │ Topic: orders.retry.5s│ (delay 5s, re-consume)
+                              └──────────┬────────────┘
+                                         │ still fail
+                                         ▼
+                              ┌──────────────────────┐
+                              │Topic: orders.retry.1m│ (delay 1 min)
+                              └──────────┬───────────┘
+                                         │ still fail
+                                         ▼
+                              ┌──────────────────────┐
+                              │  Topic: orders.DLQ   │ (manual review)
+                              └──────────────────────┘
+```
+
+### Spring Kafka — `@RetryableTopic`
+
+```java
+@RetryableTopic(
+    attempts = "4",
+    backoff = @Backoff(delay = 5000, multiplier = 2.0),
+    autoCreateTopics = "true",
+    topicSuffixingStrategy = SUFFIX_WITH_INDEX_VALUE,
+    dltStrategy = FAIL_ON_ERROR
+)
+@KafkaListener(topics = "orders", groupId = "order-svc")
+public void onOrder(Order order) {
+    // throw → goes to orders-retry-0, then -1, then -2, finally orders-dlt
+}
+
+@DltHandler
+public void onDlt(Order order, @Header(KafkaHeaders.ORIGINAL_TOPIC) String topic) {
+    log.error("Order {} bị move to DLT: {}", order.id(), topic);
+    alerting.notify("Order DLQ", order);
+}
+```
+
+→ Auto-create 4 topics: `orders`, `orders-retry-0`, `orders-retry-1`, `orders-dlt`.
+
+### DLQ Triage Process (production)
+
+1. **Alert** on DLQ depth > 0 (Prometheus + alert)
+2. **Inspect** message header `kafka_dlt-exception-stacktrace`
+3. **Fix** code/data → **replay** from DLQ topic về original topic
+4. Tools: `kafka-console-consumer`, custom replay job, AKHQ UI
+
+---
+
+## 38. Database Sharding & Partitioning
+
+### Vertical vs Horizontal Scaling
+
+```
+Vertical (Scale Up):                Horizontal (Scale Out):
+┌────────────┐                      ┌─────┐ ┌─────┐ ┌─────┐
+│            │                      │Shard│ │Shard│ │Shard│
+│   1 BIG    │                      │  1  │ │  2  │ │  3  │
+│ DB Server  │                      └─────┘ └─────┘ └─────┘
+│ 64 CPU/    │                      Each: small data subset
+│ 512GB RAM  │                      Routing layer needed
+└────────────┘
+Limit: máy lớn nhất                 Limit: thực tế không có
+Cost: $$$$$                         Cost: linear với data
+```
+
+### Partitioning Strategies
+
+#### 1. Range Partitioning
+
+```
+shard_1: user_id 0          - 1,000,000
+shard_2: user_id 1,000,001  - 2,000,000
+shard_3: user_id 2,000,001  - 3,000,000
+```
+
+Pros: query range hiệu quả. Cons: hot spot nếu data skew (latest users hot).
+
+#### 2. Hash Partitioning
+
+```
+shard = hash(user_id) % num_shards
+```
+
+Pros: even distribution. Cons: range query phải fan-out N shards.
+
+#### 3. Directory-based (Lookup Table)
+
+```
+┌────────────┐  ┌──────────────┐
+│ user_id    │  │  Shard map   │
+│ → shard_2  │  │  user_1→s1   │
+│            │  │  user_2→s3   │
+└────────────┘  └──────────────┘
+```
+
+Pros: flexible re-balance. Cons: lookup overhead.
+
+### Postgres Partitioning (native)
+
+```sql
+CREATE TABLE tasks (
+    id UUID, project_id UUID, created_at TIMESTAMP, ...
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE tasks_2026_01 PARTITION OF tasks
+    FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+
+CREATE TABLE tasks_2026_02 PARTITION OF tasks
+    FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');
+```
+
+→ Query `WHERE created_at > '2026-02-01'` chỉ scan partition liên quan (partition pruning).
+
+### Sharding Pitfalls
+
+- **Cross-shard JOIN**: tránh hoặc denormalize
+- **Re-sharding**: tốn kém — bắt đầu với 64+ "logical shards" trên 4 physical
+- **Distributed transaction**: dùng Saga, không 2PC
+- **Aggregation**: cần fan-out + merge layer
+
+---
+
+## 39. Multi-tenancy Strategies
+
+### 3 patterns
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│ 1. DATABASE PER TENANT (highest isolation)                       │
+│   Tenant A  ──► DB-A (full instance)                             │
+│   Tenant B  ──► DB-B                                             │
+│   ✓ Strong isolation, GDPR safe, custom per-tenant schema        │
+│   ✗ Cost cao (N DB instance), migration phải chạy N lần          │
+└──────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────┐
+│ 2. SCHEMA PER TENANT (medium isolation)                          │
+│   Tenant A  ──► postgres.schema_tenant_a                         │
+│   Tenant B  ──► postgres.schema_tenant_b                         │
+│   ✓ 1 DB instance, isolation tốt                                 │
+│   ✗ Migration vẫn N lần, có limit số schema (1K+)                │
+└──────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────┐
+│ 3. SHARED SCHEMA + tenant_id DISCRIMINATOR (cheapest)            │
+│   tasks(id, tenant_id, title, ...)                               │
+│   WHERE tenant_id = ?  ← mọi query                               │
+│   ✓ Rẻ nhất, scale tốt, 1 migration                              │
+│   ✗ Rủi ro leak nếu quên WHERE tenant_id                         │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### Implement Discriminator Pattern với Hibernate
+
+```java
+@Entity
+@FilterDef(name = "tenantFilter", parameters = @ParamDef(name = "tenantId", type = UUID.class))
+@Filter(name = "tenantFilter", condition = "tenant_id = :tenantId")
+public class Task {
+    @Column(name = "tenant_id", nullable = false, updatable = false)
+    private UUID tenantId;
+    // ...
+}
+
+@Component
+public class TenantFilterAspect {
+    @PersistenceContext private EntityManager em;
+
+    @Before("execution(* com.taskflow.service.*.*(..))")
+    public void enableTenantFilter() {
+        UUID tenant = TenantContext.getCurrentTenant();
+        em.unwrap(Session.class)
+          .enableFilter("tenantFilter")
+          .setParameter("tenantId", tenant);
+    }
+}
+```
+
+### Postgres Row-Level Security (defense in depth)
+
+```sql
+ALTER TABLE tasks ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation ON tasks
+    USING (tenant_id = current_setting('app.current_tenant')::uuid);
+
+-- Set per session
+SET app.current_tenant = 'tenant-a-uuid';
+```
+
+→ Even nếu app quên `WHERE tenant_id`, DB tự filter. **Production rule: dùng cả 2 lớp.**
+
+---
+
+## 40. API Gateway & BFF Pattern
+
+### Vấn đề: Frontend gọi N microservices
+
+```
+Without Gateway:
+   Web   ─────► Task Service    (auth tự handle)
+    │    ─────► User Service    (auth tự handle)
+    │    ─────► Notif Service   (auth tự handle)
+    └    ─────► Project Service (auth tự handle)
+   Mobile ──► same... và phải merge response → slow on mobile network
+```
+
+### With API Gateway
+
+```
+   ┌────────┐         ┌─────────────────────────┐
+   │  Web   │         │     API Gateway         │     ┌──────────┐
+   ├────────┤────────►│  - Auth (1 lần)         │────►│  Task    │
+   │ Mobile │         │  - Rate limit           │     ├──────────┤
+   ├────────┤────────►│  - Routing              │────►│  User    │
+   │Partner │         │  - Aggregation (BFF)    │     ├──────────┤
+   └────────┘         │  - Response shaping     │────►│  Notif   │
+                      │  - Circuit breaker      │     ├──────────┤
+                      └─────────────────────────┘────►│ Project  │
+                                                      └──────────┘
+   Tools: Spring Cloud Gateway, Kong, AWS API Gateway
+```
+
+**Cross-cutting concerns** moved ra gateway → mỗi microservice chỉ care business logic.
+
+### BFF (Backend for Frontend)
+
+Mỗi client type có 1 gateway riêng tối ưu cho nó:
+
+```
+   Web (desktop)  ──► BFF-Web     ──► microservices
+                     (rich data,
+                      JSON tree)
+
+   Mobile (3G)    ──► BFF-Mobile  ──► microservices
+                     (compact response,
+                      pre-aggregated)
+
+   Partner        ──► BFF-Partner ──► microservices
+                     (rate-limited,
+                      versioned API)
+```
+
+→ Tránh "1 size fits all" API. Mobile không cần `task.assignee.profile.preferences.*` (waste 3G bandwidth).
+
+### Spring Cloud Gateway example
+
+```yaml
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: task-service
+          uri: lb://task-service
+          predicates:
+            - Path=/api/tasks/**
+          filters:
+            - name: CircuitBreaker
+              args:
+                name: taskBreaker
+                fallbackUri: forward:/fallback/tasks
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 100
+```
+
+---
+
+## 41. Domain Events vs Integration Events
+
+Sai lầm thường gặp: phân biệt mơ hồ → schema mess, coupling cao.
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  DOMAIN EVENT (in-process, within bounded context)               │
+│                                                                  │
+│   TaskService.create()                                           │
+│       │                                                          │
+│       └── publish TaskCreated (Java object)                      │
+│              │                                                   │
+│              └── @EventListener inside SAME service              │
+│                     - update statistics                          │
+│                     - invalidate cache                           │
+│                     - trigger validation                         │
+│                                                                  │
+│   ✓ Rich domain model, refactor freely                           │
+│   ✓ Same TX boundary                                             │
+│   ✓ Spring ApplicationEvents                                     │
+└──────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────┐
+│  INTEGRATION EVENT (cross-service, public contract)              │
+│                                                                  │
+│   TaskService ──► Kafka topic: task.events                       │
+│                       │                                          │
+│                       ▼                                          │
+│                   ┌─────────────┐ ┌─────────────┐                │
+│                   │ Notif Svc   │ │ Audit Svc   │                │
+│                   │ (other team)│ │ (other team)│                │
+│                   └─────────────┘ └─────────────┘                │
+│                                                                  │
+│   ✓ Stable schema (Avro/Protobuf, versioned)                     │
+│   ✓ Eventually consistent                                        │
+│   ✓ Outbox pattern bắt buộc (xem section 9)                      │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### Naming convention
+
+- **Domain**: `TaskCreatedEvent` (verb-past-tense), rich object, full entity reference
+- **Integration**: `TaskCreatedV1` (versioned), flat DTO, IDs only (no entity reference)
+
+### Translation Layer
+
+```java
+@Component
+class TaskEventTranslator {
+
+    @EventListener   // catch domain event
+    void on(TaskCreatedEvent domainEvent) {
+        // translate → publish integration event qua outbox
+        outboxRepo.save(OutboxEvent.builder()
+            .topic("task.events")
+            .eventType("TaskCreatedV1")
+            .payload(new TaskCreatedV1(
+                domainEvent.task().id(),
+                domainEvent.task().title(),
+                domainEvent.task().createdAt()))
+            .build());
+    }
+}
+```
+
+→ Domain core không biết Kafka. Translator là **anti-corruption layer**.
+
+---
+
+## 42. Reactive Programming — WebFlux & R2DBC
+
+### Khi nào dùng?
+
+Use case "thousands of slow upstream calls" (gateway, fan-out aggregation, SSE/WebSocket fanout). KHÔNG dùng cho CRUD app thông thường (overhead, code phức tạp).
+
+### Thread model comparison
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ MVC (blocking): 1 request = 1 thread suốt life                  │
+│                                                                 │
+│  ┌──────┐  blocked   ┌──────┐  blocked  ┌──────┐                │
+│  │  T1  │───────────►│ DB   │──────────►│ HTTP │                │
+│  │      │  10ms wait │      │  50ms wait│      │                │
+│  └──────┘            └──────┘           └──────┘                │
+│  Thread sleep 60ms → cant serve other req                       │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│ WebFlux (reactive): event loop, few threads serve many requests │
+│                                                                 │
+│  Event Loop (≈ #cores threads):                                 │
+│    req1 → schedule DB call → callback registered → next req     │
+│    req2 → schedule HTTP call → callback registered → next req   │
+│    DB callback fires → resume req1 chain                        │
+│                                                                 │
+│  4 threads phục vụ 10K concurrent requests                      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Code style
+
+```java
+// MVC
+@GetMapping("/{id}")
+public Task get(@PathVariable UUID id) {
+    return taskRepo.findById(id);   // blocking
+}
+
+// WebFlux
+@GetMapping("/{id}")
+public Mono<Task> get(@PathVariable UUID id) {
+    return taskRepo.findById(id);   // returns Mono — không block
+}
+```
+
+Composition:
+
+```java
+public Mono<TaskDashboard> getDashboard(UUID userId) {
+    return Mono.zip(
+        taskRepo.findActiveByUser(userId),       // Flux<Task>
+        notifRepo.unreadCount(userId),           // Mono<Long>
+        projectRepo.findByUser(userId)           // Flux<Project>
+    ).map(tuple -> new TaskDashboard(
+        tuple.getT1(), tuple.getT2(), tuple.getT3()));
+}
+```
+
+→ 3 calls **parallel**, non-blocking. Trong MVC bạn cần `CompletableFuture` boilerplate.
+
+### Backpressure
+
+```
+Producer (fast)   ─────► Subscriber (slow)
+                          │
+                          └── signal: "I want only 10 items at a time"
+                                       (request(10))
+```
+
+Producer chỉ emit n items khi subscriber yêu cầu → tránh OOM.
+
+### Trade-offs
+
+| Aspect | MVC + Virtual Threads (Java 21) | WebFlux |
+|--------|--------------------------------|---------|
+| Code style | Imperative (dễ đọc) | Functional/callback (khó debug) |
+| Throughput | Cao (VT giải quyết blocking) | Cao |
+| Backpressure | Không có native | Built-in |
+| Stack trace | Đầy đủ | Bị fragment |
+| Library support | Tất cả Java libraries | Cần reactive driver (R2DBC, Reactor Netty) |
+
+→ **Modern rule (Java 21+):** Default dùng MVC + Virtual Threads. Chỉ dùng WebFlux khi cần backpressure thật sự (streaming, fan-out).
+
+---
+
 # Phần C — Roadmap Triển khai
 
-## 33. Roadmap 6 Phase (12 tuần)
+## 43. Roadmap 6 Phase (12 tuần)
 
 ### Phase 1 — Performance Hardening (Tuần 1-2)
 **Mục tiêu:** Loại bỏ N+1, đảm bảo concurrency safety.
@@ -2112,7 +3056,7 @@ jvm.threads.peak       — thread peak (detect leak)
 
 ---
 
-## 34. Effort Estimation Matrix
+## 44. Effort Estimation Matrix
 
 | Phase | Effort (man-days) | Risk | Business Value |
 |-------|------------------|------|----------------|
@@ -2130,7 +3074,7 @@ jvm.threads.peak       — thread peak (detect leak)
 
 ---
 
-## 35. Quick-win Priorities
+## 45. Quick-win Priorities
 
 Nếu thời gian hạn chế, làm 5 task này trước (~5 ngày, ROI cao nhất):
 
@@ -2146,10 +3090,29 @@ Sau quick-win này, dự án đã có "production grade ROI cao" mà không cầ
 
 ## Tài liệu tham khảo
 
+### Core Spring & Java
 - [Spring Boot Production-ready Features](https://docs.spring.io/spring-boot/docs/current/reference/htmlsingle/#production-ready)
 - [Resilience4j Docs](https://resilience4j.readme.io/)
-- [Microservices Patterns — Chris Richardson](https://microservices.io/patterns/)
 - [High-Performance Java Persistence — Vlad Mihalcea](https://vladmihalcea.com/books/high-performance-java-persistence/)
+- [JEP 444: Virtual Threads](https://openjdk.org/jeps/444)
+- [Spring Boot Native — GraalVM](https://docs.spring.io/spring-boot/reference/packaging/native-image/index.html)
+
+### Architecture
+- [Microservices Patterns — Chris Richardson](https://microservices.io/patterns/)
+- [Hexagonal Architecture — Alistair Cockburn](https://alistair.cockburn.us/hexagonal-architecture/)
+- [Domain-Driven Design — Eric Evans](https://www.dddcommunity.org/book/evans_2003/)
+- [Implementing Domain-Driven Design — Vaughn Vernon](https://www.informit.com/store/implementing-domain-driven-design-9780321834577)
+
+### Reliability & Observability
 - [OpenTelemetry Java](https://opentelemetry.io/docs/instrumentation/java/)
+- [Release It! — Michael T. Nygard](https://pragprog.com/titles/mnee2/release-it-second-edition/)
+- [Site Reliability Engineering (Google)](https://sre.google/books/)
+
+### Cloud Native & DevOps
 - [The Twelve-Factor App](https://12factor.net/)
 - [Cloud Native Patterns — Cornelia Davis](https://www.manning.com/books/cloud-native-patterns)
+- [Kubernetes Patterns — Bilgin Ibryam](https://www.oreilly.com/library/view/kubernetes-patterns-2nd/9781098131678/)
+
+### Data
+- [Designing Data-Intensive Applications — Martin Kleppmann](https://dataintensive.net/)
+- [Database Internals — Alex Petrov](https://www.databass.dev/)
