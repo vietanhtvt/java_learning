@@ -102,6 +102,36 @@
 54. [Query Planner & EXPLAIN Mastery](#54-query-planner--explain-mastery)
 55. [Caching Patterns (Cache-aside, Write-through, Write-behind)](#55-caching-patterns)
 
+### Phần I — Microservices Communication (mở rộng)
+
+56. [Service Mesh & Sidecar Pattern (Istio/Linkerd)](#56-service-mesh--sidecar-pattern)
+57. [gRPC vs REST vs GraphQL — chọn cái nào?](#57-grpc-vs-rest-vs-graphql)
+58. [API Gateway & BFF Pattern](#58-api-gateway--bff-pattern)
+
+### Phần J — Kafka Deep Dive (mở rộng)
+
+59. [Kafka Architecture & Replication (Topic, Partition, ISR)](#59-kafka-architecture--replication)
+60. [Consumer Group, Offset Management & Rebalancing](#60-consumer-group-offset--rebalancing)
+61. [Exactly-Once Semantics (Idempotent Producer, Transactions)](#61-exactly-once-semantics)
+
+### Phần K — Domain-Driven Design (mở rộng)
+
+62. [Strategic DDD: Bounded Context & Context Map](#62-strategic-ddd--bounded-context)
+63. [Tactical DDD: Entity, Value Object, Aggregate](#63-tactical-ddd--aggregate)
+64. [Domain Events & Anti-Corruption Layer](#64-domain-events--anti-corruption-layer)
+
+### Phần L — Modern Java & Reactive (mở rộng)
+
+65. [Java 21+ Features (Records, Sealed, Pattern Matching)](#65-java-21-features)
+66. [Structured Concurrency (JEP 453)](#66-structured-concurrency)
+67. [Reactive Streams & WebFlux (Mono/Flux, Backpressure)](#67-reactive-streams--webflux)
+
+### Phần M — Performance Engineering (mở rộng)
+
+68. [JVM Profiling (async-profiler, JFR, Flame Graph)](#68-jvm-profiling)
+69. [Latency Analysis & Tail Latency](#69-latency-analysis--tail-latency)
+70. [SLO / SLI / Error Budget](#70-slo--sli--error-budget)
+
 ---
 
 # Phần A — Phân tích Gap
@@ -4409,6 +4439,1801 @@ Strategies:
 
 ---
 
+# Phần I — Microservices Communication
+
+## 56. Service Mesh & Sidecar Pattern
+
+### Vấn đề: "Cross-cutting" lặp lại trên mọi service
+
+Khi có 20-30 microservices, mỗi service đều cần:
+
+- mTLS giữa các service (zero-trust)
+- Retry / Circuit Breaker / Timeout
+- Distributed tracing
+- Rate limiting, quota
+- Canary / traffic split
+
+Nếu nhồi tất cả vào **library** (Resilience4j, Sleuth, OAuth client) thì mỗi ngôn ngữ phải re-implement, version drift, vá lỗi 30 service mỗi lần.
+
+### Giải pháp: Service Mesh (Istio / Linkerd)
+
+Tách hết logic infrastructure ra **sidecar proxy** chạy cạnh app container.
+
+```
+┌──────────────── Pod ────────────────┐
+│  ┌────────────┐    ┌────────────┐   │
+│  │  App       │◀──▶│  Envoy     │◀──┼──▶  Network
+│  │ (TaskFlow) │    │ (sidecar)  │   │
+│  └────────────┘    └────────────┘   │
+│  localhost only    handles:         │
+│                    - mTLS           │
+│                    - retry/CB       │
+│                    - tracing        │
+│                    - metrics        │
+└─────────────────────────────────────┘
+
+Control Plane (Istiod):
+   - Đẩy config xuống tất cả sidecar
+   - Phát chứng chỉ mTLS
+   - Tổng hợp telemetry
+```
+
+### Data Plane vs Control Plane
+
+```
+┌──────────────────────────────────────────────────┐
+│  Control Plane (Istiod, Linkerd controller)      │
+│  - Service discovery                             │
+│  - Cấu hình routing                              │
+│  - Cấp phát chứng chỉ                            │
+└────────┬───────────┬─────────────┬───────────────┘
+         │ config    │ config      │ config (xDS)
+         ▼           ▼             ▼
+   ┌─────────┐  ┌─────────┐   ┌─────────┐
+   │ Sidecar │  │ Sidecar │   │ Sidecar │   ← Data Plane
+   │ (Envoy) │  │ (Envoy) │   │ (Envoy) │
+   └────┬────┘  └────┬────┘   └────┬────┘
+        │            │             │
+   ┌────▼────┐  ┌────▼────┐   ┌────▼────┐
+   │ App A   │  │ App B   │   │ App C   │
+   └─────────┘  └─────────┘   └─────────┘
+```
+
+### Lưu lượng đi qua mesh — ví dụ TaskFlow gọi Auth Service
+
+```
+[TaskFlow App] ──HTTP plain──▶ [Envoy local]
+                                    │  ← áp dụng outbound policy
+                                    │     (retry, timeout, mTLS upgrade)
+                                    ▼
+                              [Envoy remote]
+                                    │  ← áp dụng inbound policy
+                                    │     (authZ, rate limit, mTLS verify)
+                                    ▼
+                              [Auth Service App]
+```
+
+App vẫn gọi `http://auth-service/login` plain — sidecar tự upgrade lên mTLS.
+
+### VirtualService — Traffic split (canary)
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata: {name: taskflow}
+spec:
+  hosts: [taskflow]
+  http:
+    - route:
+        - destination: {host: taskflow, subset: v1}
+          weight: 95
+        - destination: {host: taskflow, subset: v2}
+          weight: 5    # canary 5% traffic
+```
+
+### DestinationRule — Circuit Breaker tại mesh
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+spec:
+  host: auth-service
+  trafficPolicy:
+    connectionPool:
+      tcp: {maxConnections: 100}
+      http: {http1MaxPendingRequests: 10, maxRequestsPerConnection: 2}
+    outlierDetection:
+      consecutive5xxErrors: 5      # 5 lỗi liên tiếp
+      interval: 30s
+      baseEjectionTime: 30s        # đẩy instance ra 30s
+      maxEjectionPercent: 50
+```
+
+→ Không cần Resilience4j trong code Java nữa.
+
+### Khi nào dùng — khi nào không
+
+| Tình huống | Service Mesh | Library trong app |
+|------------|--------------|-------------------|
+| 3-5 services, 1 ngôn ngữ | Overkill | Đơn giản, đủ |
+| 20+ services, đa ngôn ngữ | Phù hợp | Khó duy trì version |
+| Cần mTLS toàn bộ | Mesh free luôn | Tự cấu hình từng app |
+| Latency p99 < 1ms cực gắt | Sidecar thêm 1-3ms hop | Library nhanh hơn |
+| Team Ops nhỏ | Vận hành Istio nặng | Không cần platform |
+
+### Trade-off
+
+- **Cost**: Sidecar = thêm container = thêm RAM (~50-150MB/pod) + 1-3ms latency mỗi hop.
+- **Complexity**: Istio có hàng chục CRD; Linkerd nhẹ hơn nhưng ít feature.
+- **Debug**: Khi lỗi, phải biết log nào là app, log nào sidecar.
+
+---
+
+## 57. gRPC vs REST vs GraphQL
+
+### Bảng so sánh nhanh
+
+| Tiêu chí | REST/JSON | gRPC | GraphQL |
+|----------|-----------|------|---------|
+| Transport | HTTP/1.1 hoặc 2 | HTTP/2 (multiplex) | HTTP/1.1 hoặc 2 |
+| Payload | JSON (text) | Protobuf (binary) | JSON (text) |
+| Schema | OpenAPI (optional) | `.proto` (bắt buộc) | SDL (bắt buộc) |
+| Code gen | Có thể | Bắt buộc (đa ngôn ngữ) | Có (codegen client) |
+| Streaming | SSE / WebSocket riêng | Server / Client / Bi-di sẵn | Subscriptions (WS) |
+| Browser native | Có | Cần grpc-web proxy | Có |
+| Over-fetching | Hay xảy ra | Không (chọn field) | Không (client chọn) |
+| Latency | Trung bình | Thấp nhất | Trung bình |
+| Debug | curl được | Cần grpcurl | GraphiQL UI |
+
+### Khi nào chọn cái nào?
+
+```
+Phơi ra cho web/mobile public ─────────▶ REST hoặc GraphQL
+                                          (cache HTTP, CDN tốt)
+
+Service-to-service nội bộ, latency thấp ▶ gRPC
+                                          (binary, HTTP/2 multiplex)
+
+UI cần ghép nhiều resource trong 1 call ▶ GraphQL
+                                          (BFF tự nhiên)
+
+Public API, partner integration ───────▶ REST
+                                          (curl/Postman friendly)
+```
+
+### gRPC — Sơ đồ multiplexed call
+
+```
+HTTP/1.1 REST:                   gRPC (HTTP/2):
+─────────────                    ─────────────
+Conn1 ──▶ req1 ──▶ resp1         Conn ──▶ stream#1 ┐
+Conn2 ──▶ req2 ──▶ resp2                  stream#2 │ song song
+Conn3 ──▶ req3 ──▶ resp3                  stream#3 ┘
+(1 conn = 1 req/lần)             (1 conn = N stream đồng thời)
+```
+
+### Ví dụ `.proto` cho TaskFlow
+
+```protobuf
+syntax = "proto3";
+package taskflow.v1;
+
+service TaskService {
+  rpc GetTask (GetTaskRequest) returns (Task);
+  rpc ListTasks (ListTasksRequest) returns (stream Task);  // server streaming
+  rpc WatchUpdates (stream WatchRequest) returns (stream TaskEvent);  // bi-di
+}
+
+message Task {
+  string id = 1;
+  string title = 2;
+  Status status = 3;
+  google.protobuf.Timestamp due_date = 4;
+}
+
+enum Status { TODO = 0; IN_PROGRESS = 1; DONE = 2; }
+```
+
+### Spring Boot + gRPC
+
+```java
+@GrpcService
+public class TaskGrpcService extends TaskServiceImplBase {
+    @Override
+    public void getTask(GetTaskRequest req, StreamObserver<Task> obs) {
+        Task t = taskService.findById(UUID.fromString(req.getId()));
+        obs.onNext(toProto(t));
+        obs.onCompleted();
+    }
+}
+```
+
+### 4 chế độ gRPC
+
+```
+1. Unary (như REST)
+   Client ──req──▶ Server
+   Client ◀──resp── Server
+
+2. Server streaming
+   Client ──req──▶ Server
+   Client ◀──resp[1]── Server
+   Client ◀──resp[2]── Server
+   Client ◀──resp[N]── Server  (ví dụ: tail log, list large)
+
+3. Client streaming
+   Client ──req[1]──▶ Server
+   Client ──req[2]──▶ Server
+   Client ──req[N]──▶ Server
+   Client ◀──resp── Server     (ví dụ: upload file chunks)
+
+4. Bi-directional streaming
+   Client ⇄ Server (cả hai gửi nhận song song qua 1 stream)
+                                (ví dụ: chat, watch realtime)
+```
+
+### Pitfall gRPC
+
+- **Browser**: cần `grpc-web` + Envoy/proxy transcoding.
+- **Schema breaking change**: thêm field thì OK (giữ tag number), xoá field hoặc đổi type → break wire format.
+- **Load balancing**: HTTP/2 multiplexed → L4 LB sẽ "đính" client vào 1 backend. Phải dùng L7 LB (Envoy) hoặc client-side LB.
+
+### GraphQL — N+1 trap
+
+```graphql
+query {
+  tasks {       # 1 query trả N task
+    id
+    assignee {  # cho mỗi task lại fetch user → N+1!
+      name
+    }
+  }
+}
+```
+
+→ Phải dùng **DataLoader** (batch + cache trong 1 request).
+
+---
+
+## 58. API Gateway & BFF Pattern
+
+### Vấn đề
+
+Mobile/Web cần:
+- 1 endpoint cho dashboard → ghép user + tasks + notifications từ 3 service
+- Khác nhau payload: mobile cần ít field, web cần đầy đủ
+- Auth, rate limit, CORS — không muốn lặp ở mỗi service
+
+### API Gateway (1 cửa ngõ chung)
+
+```
+                        ┌─────────────────┐
+   Mobile ──▶           │                 │ ──▶ Auth Service
+   Web    ──▶  ──HTTPS─▶│  API Gateway    │ ──▶ Task Service
+   3rd party ──▶        │  (Spring Cloud  │ ──▶ Notification Service
+                        │   Gateway /     │ ──▶ Billing Service
+                        │   Kong / NGINX) │
+                        └────────┬────────┘
+                                 │
+                          Cross-cutting:
+                          - AuthN/AuthZ
+                          - Rate limit
+                          - Request log
+                          - CORS, TLS
+                          - Routing, rewrite
+```
+
+### Spring Cloud Gateway — route cho TaskFlow
+
+```yaml
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: tasks
+          uri: http://task-service:8080
+          predicates: [Path=/api/v1/tasks/**]
+          filters:
+            - StripPrefix=2
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 100  # 100 req/s
+                redis-rate-limiter.burstCapacity: 200
+        - id: auth
+          uri: http://auth-service:8080
+          predicates: [Path=/api/v1/auth/**]
+```
+
+### BFF (Backend For Frontend)
+
+Mỗi loại client có 1 BFF riêng — gateway "thông minh hơn":
+
+```
+                ┌──────────────┐
+   Mobile ─────▶│ Mobile BFF   │──┐
+                │ (lean JSON,  │  │
+                │  push token) │  │
+                └──────────────┘  │
+                                  ├──▶ Internal Services
+                ┌──────────────┐  │     (Task / User / Notification)
+   Web   ──────▶│ Web BFF      │──┤
+                │ (rich JSON,  │  │
+                │  SSR helper) │  │
+                └──────────────┘  │
+                                  │
+                ┌──────────────┐  │
+   IoT   ──────▶│ IoT BFF      │──┘
+                │ (MQTT in,    │
+                │  REST out)   │
+                └──────────────┘
+```
+
+### So sánh
+
+| Pattern | Khi nào dùng | Trade-off |
+|---------|--------------|-----------|
+| API Gateway | 1 loại client, vài service | Đơn giản; có thể "fat gateway" |
+| BFF | Nhiều loại client với nhu cầu rất khác | Mỗi BFF cần team duy trì |
+| Direct service | Nội bộ, internal admin | Khó kiểm soát chính sách chung |
+
+### Sơ đồ "fan-out / fan-in" trong BFF
+
+```
+GET /dashboard
+        │
+        ▼
+   ┌─────────┐
+   │ Web BFF │ ──┬──▶ fetch user        ─┐
+   └─────────┘   ├──▶ fetch open tasks   ├─ parallel (CompletableFuture)
+                 ├──▶ fetch notifications│
+                 └──▶ fetch billing      ─┘
+                          │
+                          ▼
+                    aggregate + transform
+                          │
+                          ▼
+              { user, tasks, notifs, billing }
+                  trả về 1 payload duy nhất
+```
+
+### Pitfall
+
+- **Latency cộng dồn**: gateway thêm 1-5ms; nếu chain 3-4 gateway → khó chịu.
+- **Single point of failure**: phải HA (≥2 instance, K8s readiness).
+- **Avoid "smart pipes, dumb endpoints"**: business logic ở service, không ở gateway.
+
+---
+
+# Phần J — Kafka Deep Dive
+
+## 59. Kafka Architecture & Replication
+
+### Đơn vị cốt lõi
+
+```
+Topic         : "kênh" logic (vd: task-events)
+  └─ Partition: shard vật lý (P0, P1, P2, ...)
+       └─ Segment: file .log + .index trên đĩa
+            └─ Record: offset + key + value + headers
+```
+
+### Topology vật lý
+
+```
+              ┌──────── Topic: task-events (3 partitions, RF=3) ────────┐
+              │                                                          │
+   Broker 1   │  P0(leader)   P1(follower)  P2(follower)                │
+   Broker 2   │  P0(follower) P1(leader)    P2(follower)                │
+   Broker 3   │  P0(follower) P1(follower)  P2(leader)                  │
+              └──────────────────────────────────────────────────────────┘
+
+Producer ghi P0 ──▶ Broker 1 (leader of P0)
+                     │
+                     └─ replicate sang Broker 2, Broker 3
+                        khi đủ ISR ack → commit offset
+```
+
+### In-Sync Replica (ISR)
+
+```
+ISR(P0) = {Broker1(leader), Broker2, Broker3}    ← tất cả đang theo kịp leader
+
+Nếu Broker3 chậm hơn 10s (replica.lag.time.max.ms):
+  ISR(P0) = {Broker1, Broker2}                   ← Broker3 bị "kick" ra
+
+Khi Broker1 chết:
+  Controller chọn leader mới từ ISR (Broker2)
+  Nếu ISR rỗng + unclean.leader.election=false → partition offline
+                + unclean.leader.election=true  → chọn replica out-of-sync (mất data)
+```
+
+### Ghi và đảm bảo bền vững — `acks`
+
+```
+acks=0   : Producer không đợi gì    → mất data nếu broker down (fire-and-forget)
+acks=1   : Đợi leader ghi disk      → mất data nếu leader chết trước replicate
+acks=all : Đợi tất cả ISR ack       → an toàn nhất (cùng min.insync.replicas=2)
+```
+
+Khuyến nghị production:
+
+```properties
+acks=all
+min.insync.replicas=2          # leader + 1 follower phải sống
+replication.factor=3
+retries=Integer.MAX_VALUE
+delivery.timeout.ms=120000
+enable.idempotence=true
+```
+
+### Partition và ordering
+
+```
+Key = userId=42  ──hash──▶ luôn rơi vào cùng 1 partition
+                            → đảm bảo thứ tự event của user#42
+
+Key = null       ──round-robin──▶ phân bổ đều, KHÔNG đảm bảo thứ tự toàn topic
+```
+
+→ Chỉ đảm bảo thứ tự **trong 1 partition**, không phải toàn topic.
+
+### Sơ đồ luồng ghi
+
+```
+Producer
+  │
+  │ 1. lookup metadata (broker nào là leader của partition?)
+  ▼
+┌──────────────┐  2. batch records  ┌──────────────┐
+│ RecordAccum  │ ─────────────────▶ │ Network IO   │ ─▶ Broker leader
+│ (in-memory)  │                    │ (Sender thr) │
+└──────────────┘                    └──────────────┘
+                                          │
+                                          │ 3. append to log segment
+                                          ▼
+                                    [P0 leader log]
+                                          │
+                                          │ 4. followers fetch & replicate
+                                          ▼
+                              [P0 follower] [P0 follower]
+                                          │
+                                          │ 5. high watermark advance
+                                          ▼
+                                    ack về producer
+```
+
+### Storage layout
+
+```
+/var/log/kafka/task-events-0/         ← P0
+    00000000000000000000.log          ← segment chứa offset 0..N
+    00000000000000000000.index        ← offset → byte position
+    00000000000000000000.timeindex    ← timestamp → offset
+    00000000000001000000.log          ← segment kế tiếp
+    leader-epoch-checkpoint
+```
+
+Retention:
+- `log.retention.hours=168` (7 ngày) hoặc `log.retention.bytes`.
+- `cleanup.policy=compact` cho topic dạng "latest state" (vd: user-profile).
+
+### Log compaction — sơ đồ
+
+```
+Trước compaction (key|value):
+  k=42|A   k=7|X   k=42|B   k=99|Z   k=42|C   k=7|Y
+
+Sau compaction (giữ value mới nhất theo key):
+  k=99|Z   k=42|C   k=7|Y
+
+→ Dùng cho event sourcing / state restore.
+```
+
+---
+
+## 60. Consumer Group, Offset & Rebalancing
+
+### Mô hình consumer group
+
+```
+Topic task-events (P0, P1, P2, P3)
+                │
+                ▼
+┌─────── Consumer Group "analytics" ───────┐
+│  Consumer A ── đọc P0, P1                │
+│  Consumer B ── đọc P2                    │
+│  Consumer C ── đọc P3                    │
+└──────────────────────────────────────────┘
+        │
+        │  ── parallel scaling: thêm consumer = chia lại partition
+        │
+┌─────── Consumer Group "billing" ────────┐  ← group khác đọc cùng topic
+│  Consumer X ── đọc P0, P1, P2, P3       │     từ offset riêng
+└─────────────────────────────────────────┘
+```
+
+**Quy tắc**: số consumer trong 1 group ≤ số partition. Thêm consumer thứ 5 vào group `analytics` → consumer thứ 5 idle.
+
+### Offset commit — 3 chiến lược
+
+```
+1. enable.auto.commit=true (auto, mỗi 5s)
+   Risk: ack offset 100 → process record 95 fail → mất message 95-100
+
+2. Manual sync commit sau khi xử lý
+   consumer.commitSync()  ← chắc chắn nhưng chậm
+
+3. Manual async + periodic sync
+   consumer.commitAsync(...)
+   try ... finally consumer.commitSync();
+```
+
+Spring Kafka:
+
+```yaml
+spring.kafka.consumer.enable-auto-commit: false
+spring.kafka.listener.ack-mode: MANUAL_IMMEDIATE
+```
+
+```java
+@KafkaListener(topics = "task-events")
+public void onMessage(ConsumerRecord<String,String> rec, Acknowledgment ack) {
+    process(rec);
+    ack.acknowledge();   // chỉ commit khi xử lý xong
+}
+```
+
+### Rebalancing — khi nào xảy ra
+
+```
+Trigger:
+  - Consumer join/leave group
+  - Consumer crash (session.timeout.ms hết)
+  - Topic thêm partition
+
+Trong rebalance, TOÀN BỘ consumer dừng poll → "stop-the-world" của group.
+```
+
+### Sơ đồ rebalance (eager)
+
+```
+Trước:  A→[P0,P1]  B→[P2,P3]
+            │
+            │ B chết
+            ▼
+Step 1: Group coordinator phát hiện (session timeout)
+Step 2: Trigger rebalance — TẤT CẢ consumer revoke partition
+            A revokes [P0,P1]
+            B đã chết
+Step 3: Mỗi consumer join lại → coordinator assign:
+            A→[P0,P1,P2,P3]
+Step 4: Resume polling từ offset cuối cùng đã commit
+
+Latency: vài giây — toàn group đứng hình.
+```
+
+### Cooperative Rebalancing (Kafka 2.4+)
+
+```
+Eager:        Stop-the-world toàn group
+Cooperative:  Chỉ partition bị di chuyển mới pause, các partition khác vẫn xử lý
+
+Bật:
+partition.assignment.strategy=org.apache.kafka.clients.consumer.CooperativeStickyAssignor
+```
+
+### Static membership — tránh rebalance khi rolling deploy
+
+```properties
+group.instance.id=consumer-1   # gán ID cố định
+session.timeout.ms=120000      # consumer restart trong 2 phút không trigger rebalance
+```
+
+### Consumer lag
+
+```
+Lag = log_end_offset (leader) - committed_offset (consumer)
+
+Monitor: kafka_consumer_lag (qua JMX hoặc Kafka Exporter → Prometheus)
+
+Alert nếu lag > X trong Y phút → consumer xử lý không kịp.
+```
+
+### Sơ đồ lag
+
+```
+Partition P0:
+  ┌──────────────────────────────────────────┐
+  │ . . . . . . . . . . . . . . . . . . . . .│
+  └──────────────────────────────────────────┘
+   ▲                       ▲                ▲
+   start              committed         log_end
+                       offset            offset
+                          └────── LAG ─────┘
+```
+
+---
+
+## 61. Exactly-Once Semantics
+
+### Mặc định: At-least-once
+
+```
+Producer gửi ──▶ broker ack timeout ──▶ producer retry
+                                          │
+                                          └─▶ broker đã ghi 1 lần
+                                              retry → ghi lần 2 (duplicate)
+```
+
+### Idempotent Producer (Kafka 0.11+)
+
+```properties
+enable.idempotence=true
+```
+
+Mỗi producer được gán **PID** (producer id) + sequence number tăng dần / partition. Broker reject duplicate dựa trên (PID, seq).
+
+```
+Producer (PID=42)
+   send seq=1 ──▶ Broker (ghi P0 offset=100)  ack timeout
+   retry seq=1 ──▶ Broker (thấy PID=42, seq=1 đã ghi) ──▶ trả ack OK, không ghi lại
+   send seq=2 ──▶ Broker (ghi offset=101)
+```
+
+→ Đảm bảo **không duplicate trong 1 partition của 1 producer session**.
+
+### Transactional Producer — atomic multi-partition
+
+```java
+producer.initTransactions();
+try {
+    producer.beginTransaction();
+    producer.send(new ProducerRecord<>("topic-A", k1, v1));
+    producer.send(new ProducerRecord<>("topic-B", k2, v2));
+    producer.commitTransaction();   // 2 record cùng visible
+} catch (KafkaException e) {
+    producer.abortTransaction();    // không record nào visible
+}
+```
+
+Sơ đồ commit:
+
+```
+TXN_BEGIN
+   ├─▶ topic-A P0: record (uncommitted marker)
+   ├─▶ topic-B P1: record (uncommitted marker)
+TXN_COMMIT
+   ├─▶ topic-A P0: commit marker  ┐
+   └─▶ topic-B P1: commit marker  ┴── consumer (isolation.level=read_committed) thấy
+```
+
+Consumer phải set:
+
+```properties
+isolation.level=read_committed   # chỉ đọc message đã commit
+```
+
+### Consume-Transform-Produce pattern (exactly-once stream)
+
+```
+┌─────────┐      ┌──────────────┐      ┌─────────┐
+│ Topic A │ ───▶ │ Processor    │ ───▶ │ Topic B │
+└─────────┘      │ (Kafka       │      └─────────┘
+                 │  Streams /   │
+                 │  consumer +  │
+                 │  producer)   │
+                 └──────────────┘
+                       │
+                       └─▶ producer.sendOffsetsToTransaction(...)
+                           "commit offset của input + record output cùng atomic"
+```
+
+```java
+producer.beginTransaction();
+producer.send(outputRecord);
+producer.sendOffsetsToTransaction(currentOffsets, consumerGroupMetadata);
+producer.commitTransaction();
+```
+
+→ Output topic và consumer offset commit cùng lúc → exactly-once.
+
+### Sơ đồ 3 mức semantics
+
+```
+At-most-once:
+  send ──▶ broker
+  (no retry, no ack check)
+  → mất message khi network blip
+
+At-least-once (mặc định):
+  send ──▶ ack timeout ──▶ retry ──▶ duplicate có thể
+
+Exactly-once:
+  idempotent producer + transactions + read_committed consumer
+  → đúng 1 lần (trong phạm vi Kafka)
+```
+
+### Lưu ý quan trọng
+
+- "Exactly-once" của Kafka chỉ áp dụng **trong cluster Kafka**. Nếu producer là Spring app vừa ghi DB vừa publish Kafka → vẫn cần **Outbox** (§9).
+- Throughput giảm ~10-30% so với at-least-once.
+- Yêu cầu: broker ≥ 0.11, producer + consumer cùng cấu hình tx.
+
+---
+
+# Phần K — Domain-Driven Design
+
+## 62. Strategic DDD — Bounded Context
+
+### Vấn đề: "Big ball of mud"
+
+Khi codebase lớn lên, "User" có nghĩa khác nhau ở các module:
+
+- **Auth**: User = email + password hash + roles
+- **Billing**: User = customer với address, tax id, payment methods
+- **Task**: User = assignee với avatar, workload
+- **Analytics**: User = event subject với cohort, behavior
+
+Nếu nhồi tất cả vào 1 class `User` → 50 field, hàng tá trách nhiệm, mọi thay đổi đụng nhau.
+
+### Bounded Context — vẽ "biên giới"
+
+```
+┌──── Auth Context ────┐   ┌──── Task Context ────┐   ┌──── Billing Context ──┐
+│                      │   │                      │   │                       │
+│  Entity: User        │   │  Entity: Assignee    │   │  Entity: Customer     │
+│   - email            │   │   - userId           │   │   - userId            │
+│   - passwordHash     │   │   - displayName      │   │   - address           │
+│   - roles            │   │   - workload         │   │   - paymentMethods    │
+│                      │   │                      │   │                       │
+│  Ubiquitous lang:    │   │  Ubiquitous lang:    │   │  Ubiquitous lang:     │
+│   - login            │   │   - assign           │   │   - charge            │
+│   - revoke token     │   │   - estimate         │   │   - refund            │
+└──────────┬───────────┘   └──────────┬───────────┘   └──────────┬────────────┘
+           │                          │                          │
+           └────────── Context Map ───┴──────────────────────────┘
+```
+
+### Context Map — kiểu quan hệ
+
+```
+[Auth] ──Customer/Supplier──▶ [Task]
+                              (Auth có quyền quyết định contract,
+                               Task phải thích nghi theo)
+
+[Task] ──Conformist──▶ [3rd-party Calendar]
+                       (đi theo schema của bên ngoài)
+
+[Task] ──Anti-Corruption Layer──▶ [Legacy CRM]
+                                  (có adapter dịch ngôn ngữ legacy
+                                   sang domain của Task)
+
+[Task] ◀──Shared Kernel──▶ [Reporting]
+                           (cùng dùng module nhỏ, đồng bộ rất chặt)
+```
+
+### Sơ đồ tổ chức context trong TaskFlow
+
+```
+                 ┌────────────────┐
+                 │  Identity &    │  publishes UserRegistered, UserDeleted
+                 │  Access (IAM)  │
+                 └────────┬───────┘
+                          │ event
+                          ▼
+        ┌──────────────────────────────────────┐
+        │              Task Management         │
+        │  - Project, Task, Assignee, Label    │
+        │  - Aggregates: Project, Task         │
+        └─────┬──────────────────┬─────────────┘
+              │                  │
+   publishes TaskCompleted    publishes TaskCreated
+              │                  │
+              ▼                  ▼
+   ┌──────────────────┐   ┌──────────────────┐
+   │  Notification    │   │  Analytics       │
+   │  (push, email)   │   │  (dashboards)    │
+   └──────────────────┘   └──────────────────┘
+```
+
+Mỗi context = 1 module Maven hoặc 1 microservice — biên giới rõ về **code** và **deploy**.
+
+### Ubiquitous Language
+
+```
+Trong Task context:
+  - "assign a task to a user"   ← từ vựng đội nghiệp vụ dùng
+  - "complete a task"           ← KHÔNG dùng "finalize / close / resolve" lẫn lộn
+  - "blocked by"
+
+Code phải dùng đúng từ này:
+  task.assignTo(assignee)
+  task.complete()
+  task.blockedBy(another)
+```
+
+### Lợi ích
+
+- Mỗi context có model riêng → không lo "thượng đế class".
+- Có thể deploy độc lập (microservice tự nhiên).
+- Đồng bộ ngôn ngữ giữa dev và business → ít hiểu nhầm.
+
+---
+
+## 63. Tactical DDD — Aggregate
+
+### Building blocks
+
+| Khái niệm | Ý nghĩa | Ví dụ |
+|-----------|---------|-------|
+| Entity | Có ID, lifecycle, mutable | `Task`, `Project`, `User` |
+| Value Object | Không ID, immutable, so sánh bằng giá trị | `Money`, `Email`, `DateRange` |
+| Aggregate | Cluster object với 1 **root** điều phối invariant | `Project` (root) + `Task` (member) |
+| Aggregate Root | Entity là cửa ngõ duy nhất ra/vào aggregate | `Project` |
+| Repository | Lưu/lấy aggregate | `ProjectRepository` |
+| Domain Service | Logic không thuộc về 1 entity nào | `TaskAssignmentPolicy` |
+| Domain Event | Việc đã xảy ra trong domain | `TaskAssigned`, `ProjectArchived` |
+
+### Sơ đồ Aggregate Project
+
+```
+   ┌────────────────────────────────────────────────────────┐
+   │                  AGGREGATE BOUNDARY                    │
+   │                                                        │
+   │     ┌──────────────┐   (root, external entry)          │
+   │     │   Project    │◀──── Repository chỉ thấy root     │
+   │     │              │                                   │
+   │     │  + addTask() │                                   │
+   │     │  + archive() │                                   │
+   │     └──────┬───────┘                                   │
+   │            │ 1..*                                      │
+   │            ▼                                           │
+   │     ┌──────────────┐    ┌──────────────┐               │
+   │     │    Task      │    │   Member     │ (internal)    │
+   │     │              │    │              │               │
+   │     │ - title      │    │ - userId     │               │
+   │     │ - status     │    │ - role       │               │
+   │     └──────────────┘    └──────────────┘               │
+   │                                                        │
+   └────────────────────────────────────────────────────────┘
+        ▲                                            │
+        │ load/save toàn aggregate                   │ refs by ID only
+        │                                            ▼
+   ProjectRepository                          UserId, AssigneeId
+   (không có TaskRepository, MemberRepository riêng)
+```
+
+**Quy tắc vàng**:
+1. Bên ngoài aggregate chỉ tham chiếu **bằng ID**, không giữ object reference.
+2. Mỗi transaction chỉ thay đổi **1 aggregate**.
+3. Aggregate phải đủ nhỏ để invariant rõ ràng — đừng nhồi cả "User chứa toàn bộ Tasks".
+
+### Value Object — bất biến và an toàn
+
+```java
+public record Money(BigDecimal amount, Currency currency) {
+    public Money {
+        if (amount.signum() < 0) throw new IllegalArgumentException("negative");
+        Objects.requireNonNull(currency);
+    }
+    public Money add(Money other) {
+        if (!currency.equals(other.currency)) throw new IllegalArgumentException();
+        return new Money(amount.add(other.amount), currency);
+    }
+}
+```
+
+→ `equals`/`hashCode` tự sinh theo giá trị → so sánh `new Money(100, USD).equals(new Money(100, USD))` = true.
+
+### Entity với invariant — Task
+
+```java
+@Entity
+public class Task {
+    @Id private UUID id;
+    private String title;
+    private TaskStatus status;
+    @Version private Long version;
+
+    public void complete() {
+        if (status == CANCELLED) throw new IllegalStateException("Cannot complete cancelled task");
+        this.status = DONE;
+        registerEvent(new TaskCompleted(this.id, Instant.now()));
+    }
+
+    public void assignTo(UserId assignee) {
+        if (status == DONE) throw new IllegalStateException("Task already done");
+        this.assigneeId = assignee;
+        registerEvent(new TaskAssigned(this.id, assignee));
+    }
+}
+```
+
+→ Logic ở entity, không "anemic model" (entity rỗng + service thao tác hết).
+
+### Anemic vs Rich domain model
+
+```
+ANEMIC (anti-pattern):
+  TaskEntity { id, title, status; getters/setters }
+  TaskService { complete(task) { task.setStatus(DONE); ... } }
+                                  ↑ ai cũng có thể set bậy
+
+RICH (DDD):
+  Task { id, title, status; complete() { invariant... } }
+  TaskService { complete(id) { task.complete(); save(); } }
+                                ↑ logic được bảo vệ trong aggregate
+```
+
+### Lookup aggregate
+
+```java
+public interface ProjectRepository {
+    Optional<Project> findById(ProjectId id);
+    void save(Project project);
+    // KHÔNG có findTaskById(...) — đi qua Project
+}
+```
+
+Nếu muốn query Task xuyên project → tạo **read model** (CQRS, §22) thay vì xé aggregate.
+
+---
+
+## 64. Domain Events & Anti-Corruption Layer
+
+### Domain Event là gì?
+
+Sự thật đã xảy ra trong miền nghiệp vụ — đặt tên **quá khứ**:
+
+- `TaskAssigned`
+- `ProjectArchived`
+- `PaymentRefunded`
+
+Khác với "Command" (mệnh lệnh chưa xảy ra: `AssignTask`).
+
+### Sơ đồ phát event từ aggregate
+
+```
+┌────────────────────────────────────────────────────────────┐
+│ HTTP Layer  ─▶ App Service ─▶ Aggregate (state change)     │
+│                                  │                         │
+│                                  │ registerEvent(...)      │
+│                                  ▼                         │
+│                          Domain Events list                │
+│                                  │                         │
+│                                  │ flush khi @Transactional commit
+│                                  ▼                         │
+│                  ApplicationEventPublisher                 │
+│                       │                  │                 │
+│              ┌────────▼────────┐  ┌──────▼────────┐        │
+│              │ Email handler   │  │ Outbox writer │        │
+│              │ (sync, same TX) │  │ (publish KFK) │        │
+│              └─────────────────┘  └───────────────┘        │
+└────────────────────────────────────────────────────────────┘
+```
+
+### Implementation — Spring `AbstractAggregateRoot`
+
+```java
+@Entity
+public class Task extends AbstractAggregateRoot<Task> {
+    public void complete() {
+        this.status = DONE;
+        registerEvent(new TaskCompleted(this.id, Instant.now()));
+    }
+}
+
+@Service
+class TaskService {
+    @Transactional
+    public void complete(UUID id) {
+        Task task = repo.findById(id).orElseThrow();
+        task.complete();
+        repo.save(task);   // Spring Data tự publish event sau save
+    }
+}
+
+@Component
+class TaskEventHandler {
+    @TransactionalEventListener(phase = AFTER_COMMIT)
+    public void on(TaskCompleted ev) {
+        notification.send(ev);
+    }
+}
+```
+
+`AFTER_COMMIT` = chỉ gọi handler sau khi TX commit thành công → không bị lỗi side-effect khi rollback.
+
+### Internal vs Integration Event
+
+```
+Internal Event:
+  - chỉ luân chuyển trong aggregate / context
+  - dùng ApplicationEventPublisher
+  - schema có thể đổi tự do
+
+Integration Event:
+  - phát ra ngoài context (Kafka, RabbitMQ)
+  - schema phải versioned (Avro, Protobuf)
+  - đặt tên theo nghiệp vụ chung: TaskCompletedV1
+  - bao gồm đủ context cho consumer (không phải chỉ ID)
+```
+
+### Sơ đồ Internal → Integration
+
+```
+Aggregate raises:    TaskCompleted (internal POJO)
+                                │
+                                ▼
+              ┌─────────────────────────────────────┐
+              │ Listener trong cùng context         │
+              │  - cập nhật read model              │
+              │  - gửi email                        │
+              └─────────────────────────────────────┘
+                                │
+                                ▼
+              ┌─────────────────────────────────────┐
+              │ Outbox writer → Kafka               │
+              │  publish "task.completed.v1"        │
+              │   (Avro, schema registry)           │
+              └─────────────────────────────────────┘
+                                │
+            ┌───────────────────┼────────────────────┐
+            ▼                   ▼                    ▼
+      [Billing ctx]      [Analytics ctx]     [3rd-party CRM]
+```
+
+### Anti-Corruption Layer (ACL)
+
+Khi tích hợp với hệ thống **legacy** hoặc **third-party** có model "kỳ quặc", đừng để mô hình của họ rò vào domain.
+
+```
+┌──────────────────────────────────────────────────┐
+│  Domain bên trong (sạch)                         │
+│                                                  │
+│   Task ▸ assignTo(UserId)                        │
+│                                                  │
+└────────────────┬─────────────────────────────────┘
+                 │ Port (interface): NotifyUser
+                 │
+                 ▼
+   ┌──────────────────────────────┐
+   │  Anti-Corruption Layer       │
+   │  - dịch UserId → legacyId    │
+   │  - map field name khác       │
+   │  - xử lý timezone weird      │
+   └──────────────┬───────────────┘
+                  │
+                  ▼
+   ┌──────────────────────────────┐
+   │  Legacy CRM API              │
+   │  POST /users/{lglId}/notify  │
+   │  body: { msg_typ, txt_b64 }  │  ← schema khó chịu
+   └──────────────────────────────┘
+```
+
+### Ví dụ ACL — port + adapter
+
+```java
+// Domain port (sạch)
+public interface NotifyUserPort {
+    void notify(UserId user, NotificationMessage msg);
+}
+
+// Adapter (ACL — chứa toàn bộ ngôn ngữ "bẩn" của legacy)
+@Component
+class LegacyCrmAdapter implements NotifyUserPort {
+    public void notify(UserId user, NotificationMessage msg) {
+        var legacyId = idMapper.toLegacy(user);
+        var payload = new LegacyMsgPayload(
+            "URG",                                 // legacy "msg_typ"
+            Base64.getEncoder().encodeToString(   // legacy "txt_b64"
+                msg.text().getBytes(UTF_8))
+        );
+        legacyApi.post("/users/" + legacyId + "/notify", payload);
+    }
+}
+```
+
+Domain code không bao giờ thấy `msg_typ`, `txt_b64`, `legacyId`.
+
+### Khi nào dùng ACL
+
+- Tích hợp legacy không kiểm soát được
+- Tích hợp third-party SaaS (Stripe, SendGrid)
+- Migration: chạy song song hệ thống cũ + mới, ACL giúp 2 bên cùng tồn tại
+
+---
+
+# Phần L — Modern Java & Reactive
+
+## 65. Java 21+ Features
+
+### Records — Data class ngắn gọn
+
+```java
+// TRƯỚC: 30 dòng boilerplate
+public final class TaskDto {
+    private final UUID id;
+    private final String title;
+    public TaskDto(UUID id, String title) { ... }
+    public UUID id() { ... }
+    public String title() { ... }
+    @Override public boolean equals(...) { ... }
+    @Override public int hashCode() { ... }
+    @Override public String toString() { ... }
+}
+
+// SAU: 1 dòng
+public record TaskDto(UUID id, String title) {}
+```
+
+Đặc tính:
+- Final, immutable, các field cũng final.
+- `equals`/`hashCode`/`toString` tự sinh theo component.
+- Có thể validate trong compact constructor:
+
+```java
+public record Email(String value) {
+    public Email {                          // compact ctor
+        Objects.requireNonNull(value);
+        if (!value.contains("@")) throw new IllegalArgumentException();
+    }
+}
+```
+
+→ Lý tưởng cho DTO, Value Object, message Kafka.
+
+### Sealed Classes — đóng kín hierarchy
+
+```java
+public sealed interface PaymentResult
+        permits Success, Declined, PendingReview {}
+
+public record Success(String txnId) implements PaymentResult {}
+public record Declined(String reason) implements PaymentResult {}
+public record PendingReview(Duration eta) implements PaymentResult {}
+```
+
+→ Compiler biết **chỉ có 3 nhánh** → khi `switch` không cần `default`:
+
+```java
+String describe(PaymentResult r) {
+    return switch (r) {
+        case Success s        -> "OK " + s.txnId();
+        case Declined d       -> "REJ " + d.reason();
+        case PendingReview p  -> "WAIT " + p.eta();
+        // thêm subclass mới → compile error, ép update mọi nơi
+    };
+}
+```
+
+→ Lý tưởng cho state machine, result type, ADT.
+
+### Pattern Matching cho `switch` & `instanceof`
+
+```java
+// TRƯỚC
+if (obj instanceof String s) {
+    return s.length();
+} else if (obj instanceof List<?> l) {
+    return l.size();
+}
+
+// SAU — switch pattern (Java 21)
+return switch (obj) {
+    case String s              -> s.length();
+    case List<?> l             -> l.size();
+    case Integer i when i > 0  -> i;
+    case null                  -> 0;
+    default                    -> -1;
+};
+```
+
+### Record Pattern (deconstruction)
+
+```java
+record Point(int x, int y) {}
+record Line(Point from, Point to) {}
+
+double length(Line l) {
+    return switch (l) {
+        case Line(Point(int x1, int y1), Point(int x2, int y2))
+            -> Math.hypot(x2-x1, y2-y1);
+    };
+}
+```
+
+### Text Blocks
+
+```java
+String json = """
+    {
+      "id": "%s",
+      "status": "%s"
+    }
+    """.formatted(id, status);
+```
+
+→ Đỡ phải `\n` `\"` khi viết SQL, JSON, HTML inline.
+
+### Bảng tóm tắt feature theo phiên bản
+
+| JEP | Feature | LTS |
+|-----|---------|-----|
+| 395 | Records | 16 |
+| 409 | Sealed classes | 17 |
+| 378 | Text Blocks | 15 |
+| 441 | Pattern matching for switch | 21 |
+| 440 | Record patterns | 21 |
+| 444 | Virtual Threads | 21 |
+| 453 | Structured Concurrency (preview) | 21 |
+| 454 | Foreign Function & Memory API | 22 |
+| 459 | String Templates (preview) | 21 |
+
+### Áp dụng vào TaskFlow
+
+```java
+// Result type cho domain operation
+public sealed interface AssignResult {
+    record Success(Task task) implements AssignResult {}
+    record AssigneeNotFound(UUID userId) implements AssignResult {}
+    record TaskClosed(UUID taskId) implements AssignResult {}
+}
+
+@Service
+class TaskService {
+    public AssignResult assign(UUID taskId, UUID userId) { ... }
+}
+
+// Controller xử lý
+return switch (taskService.assign(t, u)) {
+    case Success(Task task)             -> ResponseEntity.ok(TaskDto.from(task));
+    case AssigneeNotFound(UUID id)      -> ResponseEntity.status(404).body("user " + id);
+    case TaskClosed(UUID id)            -> ResponseEntity.status(409).body("task closed");
+};
+```
+
+→ Không cần exception cho business case, type-safe, exhaustive.
+
+---
+
+## 66. Structured Concurrency
+
+### Vấn đề với `ExecutorService` "phẳng"
+
+```java
+ExecutorService ex = Executors.newFixedThreadPool(10);
+Future<User> uF   = ex.submit(() -> fetchUser(id));
+Future<Order> oF  = ex.submit(() -> fetchOrder(id));
+User u = uF.get();
+Order o = oF.get();     // nếu task này throw, task uF có thể vẫn chạy → leak
+```
+
+Vấn đề:
+- Không có "cha-con" giữa task → task lẻ có thể sống lâu hơn caller.
+- Lỗi 1 task không cancel task khác → lãng phí.
+- Stack trace bị mất ngữ cảnh "task này thuộc về request nào".
+
+### Structured Concurrency (JEP 453, preview Java 21)
+
+```java
+try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+    Subtask<User>  user  = scope.fork(() -> fetchUser(id));
+    Subtask<Order> order = scope.fork(() -> fetchOrder(id));
+
+    scope.join();           // chờ tất cả
+    scope.throwIfFailed();  // nếu task nào fail, các task khác đã bị cancel
+
+    return new Dashboard(user.get(), order.get());
+}   // scope close → đảm bảo không có thread "mồ côi"
+```
+
+### Sơ đồ vòng đời
+
+```
+   fork()           fork()
+     │                │
+     ▼                ▼
+  ┌──────┐        ┌───────┐
+  │ user │        │ order │
+  └──┬───┘        └───┬───┘
+     │ Exception      │
+     │                │ scope detect failure
+     │                │ → cancel(interrupt) tất cả task khác
+     ▼                ▼
+  cancelled         throws e
+
+  scope.throwIfFailed() ──▶ ném ra exception nguyên gốc
+                            (kèm cancellation của siblings)
+
+  try-with-resources kết thúc:
+     - đảm bảo tất cả subtask đã terminate
+     - không leak thread, không leak resource
+```
+
+### Các loại scope
+
+```
+ShutdownOnFailure   : 1 lỗi → cancel hết (race-to-result hoặc all-must-succeed)
+ShutdownOnSuccess   : 1 thành công → cancel còn lại (race to first answer)
+Custom              : extend StructuredTaskScope tự định nghĩa
+```
+
+### Kết hợp Virtual Thread
+
+```java
+try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+    // Mỗi fork = 1 virtual thread (rất rẻ)
+    List<Subtask<TaskDto>> tasks = userIds.stream()
+        .map(id -> scope.fork(() -> taskClient.fetch(id)))
+        .toList();
+    scope.join().throwIfFailed();
+    return tasks.stream().map(Subtask::get).toList();
+}
+```
+
+→ Fan-out 10.000 HTTP call song song = 10.000 VT — trước Loom không thể.
+
+### Lợi ích quan sát (observability)
+
+- Stack trace của subtask gắn với caller → debug thread dump rõ ràng "thread này thuộc request nào".
+- Cancellation propagation tự động → không có code "tay" để hủy.
+- Code đọc giống synchronous nhưng chạy song song.
+
+---
+
+## 67. Reactive Streams & WebFlux
+
+### Khi nào dùng Reactive (WebFlux) thay vì MVC
+
+```
+Spring MVC (Tomcat / blocking):
+  1 request = 1 thread
+  - Code đơn giản, blocking-style
+  - Với Virtual Thread (Java 21) → throughput rất cao mà code vẫn blocking
+  → MVC + VT giải quyết 80% nhu cầu hiện đại
+
+Spring WebFlux (Netty / non-blocking):
+  N request = ít thread (event loop)
+  - Code reactive (Mono/Flux) — khó debug, learning curve
+  - Backpressure built-in
+  → chỉ dùng khi có lý do mạnh:
+     - Streaming Server-Sent Events
+     - Aggregate nhiều downstream với backpressure
+     - Tích hợp reactive driver (R2DBC, reactive Mongo)
+```
+
+### Mono & Flux
+
+```
+Mono<T>  : 0 hoặc 1 phần tử (giống CompletableFuture)
+Flux<T>  : 0..N phần tử (stream)
+
+Cold:  publisher chỉ chạy khi có subscriber (lazy)
+Hot:   publisher chạy luôn, subscriber nhận từ "thời điểm subscribe"
+```
+
+### Sơ đồ pipeline reactive
+
+```
+HTTP request
+     │
+     ▼
+┌─────────────┐        ┌─────────────┐        ┌─────────────┐
+│  Mono<User> │──map──▶│ Mono<Profile│──zipWith┤Mono<Permis> │
+│ fetchUser() │        │  enrich()   │        │ fetchPerms()│
+└─────────────┘        └─────────────┘        └──────┬──────┘
+                                                     │
+                                                     ▼
+                                       ┌──────────────────────┐
+                                       │ Mono<Dashboard>      │
+                                       │ (User + Permissions) │
+                                       └──────────┬───────────┘
+                                                  │
+                                                  ▼
+                                        HTTP response (Netty)
+
+  Event loop thread không bao giờ block.
+  IO bất đồng bộ → callback đẩy item xuống pipeline.
+```
+
+### Code ví dụ — TaskFlow reactive
+
+```java
+@RestController
+class TaskController {
+    @GetMapping("/dashboard")
+    public Mono<DashboardDto> dashboard(@AuthenticationPrincipal User u) {
+        Mono<UserProfile> profile = profileClient.fetch(u.id());
+        Mono<List<Task>>  tasks   = taskClient.fetchAssigned(u.id());
+        Mono<Long>        unread  = notifClient.countUnread(u.id());
+
+        return Mono.zip(profile, tasks, unread)
+                   .map(t -> new DashboardDto(t.getT1(), t.getT2(), t.getT3()));
+    }
+}
+```
+
+3 call song song trên event loop, không thread nào block chờ IO.
+
+### Backpressure — sơ đồ
+
+```
+Publisher                    Subscriber
+   │                             │
+   │ ◀──── request(10) ───────── │   ← subscriber bảo "tôi sẵn sàng 10"
+   │                             │
+   │ ──── onNext(1..10) ───────▶ │
+   │                             │
+   │ ◀──── request(5) ────────── │   ← xử lý xong, xin tiếp 5
+   │ ──── onNext(11..15) ──────▶ │
+   │                             │
+   │ ◀──── cancel ────────────── │   ← hoặc subscriber kết thúc sớm
+```
+
+Subscriber luôn kiểm soát tốc độ → producer không thể "đẩy chìm" consumer.
+
+### Operator phổ biến
+
+```
+map        : transform 1-1
+flatMap    : transform 1-N (giữ thứ tự bất định)
+concatMap  : flatMap nhưng giữ thứ tự (slower)
+filter     : lọc
+zip        : kết hợp song song N publisher
+merge      : trộn nhiều stream
+switchMap  : drop kết quả cũ khi có mới (typeahead search)
+retry      : retry on error
+timeout    : ném TimeoutException sau X
+onErrorResume : fallback
+```
+
+### Pitfall
+
+- **Blocking call ở giữa pipeline** = giết event loop:
+  ```java
+  Mono.fromSupplier(() -> jdbcTemplate.query(...))  // SAI — block event loop
+  ```
+  → Phải `Mono.fromSupplier(...).subscribeOn(Schedulers.boundedElastic())` hoặc đổi sang R2DBC.
+
+- **ThreadLocal không hoạt động** — context bị mất qua scheduler. Dùng `Reactor Context`.
+
+- **Stack trace mất ngữ cảnh** — bật `Hooks.onOperatorDebug()` ở dev.
+
+### So sánh với MVC + Virtual Thread
+
+| Tiêu chí | MVC + VT (Java 21) | WebFlux |
+|----------|--------------------|----|
+| Code style | Imperative blocking | Reactive |
+| Throughput I/O-bound | Rất cao (triệu VT) | Rất cao |
+| Backpressure | Không có sẵn | Có sẵn |
+| Streaming SSE/WS | Được nhưng phức tạp | Tự nhiên |
+| ThreadLocal/MDC | Hoạt động | Phải bridging |
+| Learning curve | Thấp | Cao |
+
+→ Quy tắc 2026: chọn **MVC + Virtual Threads** trừ khi cần streaming/backpressure thực sự.
+
+---
+
+# Phần M — Performance Engineering
+
+## 68. JVM Profiling
+
+### Bộ công cụ profiling
+
+| Tool | Loại | Khi nào dùng |
+|------|------|--------------|
+| `jcmd` / `jstack` | Thread dump tức thời | Deadlock, hang |
+| Java Flight Recorder (JFR) | Sampling, low overhead (~1%) | Production profiling |
+| async-profiler | Sampling CPU + alloc, off-CPU | Flame graph chính xác (no safepoint bias) |
+| `jconsole` / VisualVM | JMX monitor | Dev / staging |
+| JDK Mission Control (JMC) | Phân tích JFR | Đọc JFR file |
+| `jmap` + Eclipse MAT | Heap dump | Memory leak, OOM phân tích |
+
+### JFR — bật trong production
+
+```bash
+# Continuous recording, file roll mỗi giờ
+java -XX:StartFlightRecording=disk=true,maxage=24h,maxsize=1g,settings=profile \
+     -XX:FlightRecorderOptions=repository=/var/jfr \
+     -jar app.jar
+```
+
+Hoặc dynamic:
+```bash
+jcmd <pid> JFR.start name=hot duration=60s filename=/tmp/hot.jfr
+jcmd <pid> JFR.dump name=hot filename=/tmp/dump.jfr
+```
+
+Mở bằng JMC → xem method hot, alloc hot, lock contention.
+
+### async-profiler — Flame Graph
+
+```bash
+# Sample CPU 30s, ra HTML flamegraph
+asprof -d 30 -f /tmp/cpu.html <pid>
+
+# Sample allocation
+asprof -e alloc -d 30 -f /tmp/alloc.html <pid>
+
+# Wall-clock (off-CPU: blocked, sleep, I/O wait)
+asprof -e wall -d 30 -f /tmp/wall.html <pid>
+```
+
+### Đọc Flame Graph
+
+```
+Chiều ngang   = % thời gian CPU
+Chiều dọc     = call stack (caller → callee)
+
+   ┌─────────────────────────────────────────────────────┐
+   │ httpHandle  ████████████████████████████ 80% CPU    │
+   │  → service  ███████████████████████ 70%             │
+   │     → dao   ███████████████ 50%                     │
+   │        → toString ████ 15%   ← "tháp" cao = hot path│
+   │              → format ███ 12%                       │
+   └─────────────────────────────────────────────────────┘
+
+Cột nào càng "rộng" càng tiêu CPU nhiều.
+Phẳng và rộng ở đáy = bottleneck (vd: GC, JIT).
+```
+
+### CPU profiling vs Allocation profiling
+
+```
+CPU flame    : tốn CPU ở đâu? (logic loop, parse, compress)
+Alloc flame  : tạo object ở đâu? (giảm GC pressure)
+Wall flame   : thời gian thực ở đâu? (gồm cả wait I/O, lock)
+Lock flame   : block ở monitor nào? (contention)
+```
+
+### Quy trình debug latency
+
+```
+1. Đo p99 latency (từ APM, Prometheus histogram)
+        │
+        ▼
+2. Trace 1 request slow → tìm span tốn nhiều thời gian (mục §13)
+        │
+        ▼
+3. JFR/async-profiler 60s khi traffic cao
+        │
+        ├─▶ CPU hot path → tối ưu algorithm, cache
+        ├─▶ Alloc hot path → reuse, primitive, off-heap
+        ├─▶ Lock contention → giảm critical section, đổi data structure
+        └─▶ GC pause → đổi GC, tune heap (xem §32, §37)
+```
+
+### Heap dump khi OOM
+
+```bash
+-XX:+HeapDumpOnOutOfMemoryError
+-XX:HeapDumpPath=/var/dump/heap.hprof
+```
+
+Phân tích bằng **Eclipse MAT**:
+- *Dominator Tree* → object nào giữ nhiều memory nhất.
+- *Leak Suspects* → tự gợi ý nguồn leak (vd: `static Map` to dần).
+
+---
+
+## 69. Latency Analysis & Tail Latency
+
+### Trung bình ẨN bottleneck
+
+```
+Latency mean   = 50ms     ← trông đẹp
+Latency p50    = 30ms     ← phần lớn user ổn
+Latency p95    = 200ms    ← bắt đầu khó chịu
+Latency p99    = 1.2s     ← 1% user đợi cực lâu
+Latency p99.9  = 5s       ← 0.1% chờ vô tận
+```
+
+Trong service "fan-out 10 downstream":
+
+```
+P(1 call > p99) = 1%
+P(ít nhất 1 trong 10 call > p99) = 1 - (0.99)^10 ≈ 9.6%
+
+→ p99 của caller bị "kéo lên" theo p99 của downstream.
+```
+
+### Nguồn của tail latency
+
+| Nguyên nhân | Dấu hiệu |
+|-------------|----------|
+| GC pause | Tail spike khớp GC log |
+| Thread pool exhaustion | Queue time tăng đột biến |
+| Lock contention | CPU thấp nhưng p99 cao |
+| Cold cache | Spike khi deploy / cache TTL |
+| DB lock / lock wait | Postgres `pg_locks` show wait |
+| Network blip / TCP retransmit | p99 ngẫu nhiên, không pattern |
+| Noisy neighbor (cloud) | Random spike, không reproduce |
+| Garbage in connection pool | Lag khi pool reset |
+
+### Histogram trong Spring Boot
+
+```java
+@Timed(value = "task.get", percentiles = {0.5, 0.95, 0.99})
+@GetMapping("/tasks/{id}")
+public TaskDto getTask(...) { ... }
+```
+
+Hoặc trong code:
+
+```java
+Timer timer = Timer.builder("task.get")
+    .publishPercentileHistogram()    // gửi nguyên histogram → Prometheus tính percentile chính xác
+    .register(meterRegistry);
+```
+
+→ Trong Prometheus query:
+```promql
+histogram_quantile(0.99, rate(task_get_seconds_bucket[5m]))
+```
+
+### Sơ đồ giảm tail latency
+
+```
+Strategy                       Tác dụng
+─────────────────────────────  ──────────────────────────────
+Hedge request (gọi 2 backend) → giảm p99 nhờ "race" → tăng cost
+Backup request after p95      → tương tự, nhẹ hơn
+Bulkhead (mục §8)             → cô lập slow caller
+Adaptive timeout              → cắt sớm, retry sang replica
+Cache warm-up after deploy    → tránh cold start spike
+Pre-fetch connection pool     → tránh lag khi pool grow
+Reduce fan-out (batch call)   → ít cơ hội bị "trúng" tail
+```
+
+### Sơ đồ Hedge Request
+
+```
+Request đến                    Backend A (chậm)
+   │ ──── send to A ──────────────▶│
+   │                               │ p99 spike: 1.2s
+   │ ── nếu sau 100ms chưa có ───┐ │
+   │    resp → gửi A' parallel   │ │
+   │                             ▼ │
+   │ ──── send to A' ──────────────▶│
+   │                            ◀─resp A' nhanh hơn (50ms)
+   │ ◀─── resp from A' first ──────│
+   │      hủy/ignore A
+```
+
+Trade-off: tăng load backend ~5-10%, giảm p99 đáng kể.
+
+### Coordinated Omission — bẫy benchmark
+
+Khi load test, **client tự throttle khi server chậm** → benchmark bị mất phần latency tệ nhất.
+
+→ Dùng tool **HdrHistogram** + **wrk2** / **k6** có "open model" (gửi đúng RPS bất kể server chậm) để đo chân thực.
+
+---
+
+## 70. SLO / SLI / Error Budget
+
+### Khái niệm
+
+```
+SLI (Service Level Indicator):  số liệu thực đo được
+   vd: % request thành công, latency p99
+
+SLO (Service Level Objective):  mục tiêu nội bộ
+   vd: 99.9% request thành công trong 30 ngày
+
+SLA (Service Level Agreement):  cam kết HỢP ĐỒNG với khách hàng
+   vd: 99.5% uptime, hoàn tiền nếu vi phạm
+   (luôn lỏng hơn SLO để có "buffer")
+```
+
+### Error Budget — Số phép sai
+
+```
+SLO = 99.9% → budget = 0.1%
+Trong 30 ngày = 43200 phút
+Error budget = 43200 × 0.001 = 43 phút downtime / tháng
+
+Còn budget → dev được phép ship feature mới, take risk
+Hết budget → freeze feature, focus reliability
+```
+
+### Sơ đồ Error Budget Burn
+
+```
+Budget tích luỹ 100% ┌─────┐
+                     │     ╲
+                     │      ╲ deploy bug → tốn 30%
+                     │       ╲___
+                     │           ╲___
+                     │               ╲___ baseline burn 5%/tuần
+                     │                   ╲___
+                     │                       ╲ alert: 80% used
+                     │                          ╲
+                     │                           ╲
+              0%     └───────────────────────────────╲ FREEZE
+                     0d       10d      20d       30d
+```
+
+### Multi-window burn-rate alert (Google SRE)
+
+```
+Burn rate = (errors trong window) / (budget cho window đó)
+
+Alert:
+  - Burn rate ≥ 14.4 trong 1 giờ   → critical (sẽ cháy budget tháng trong < 2h)
+  - Burn rate ≥ 6   trong 6 giờ    → high
+  - Burn rate ≥ 3   trong 24 giờ   → medium
+  - Burn rate ≥ 1   trong 3 ngày   → low
+```
+
+→ Tránh alert quá nhạy (mỗi blip = page) và quá trễ (mất budget rồi mới biết).
+
+### SLI ví dụ cho TaskFlow
+
+```
+1. Availability SLI:
+   sum(rate(http_server_requests_seconds_count{status!~"5.."}[5m]))
+   / sum(rate(http_server_requests_seconds_count[5m]))
+
+   SLO: ≥ 99.9% over 30d
+
+2. Latency SLI:
+   histogram_quantile(0.99,
+     rate(http_server_requests_seconds_bucket{uri="/tasks"}[5m]))
+
+   SLO: p99 < 300ms over 30d
+
+3. Freshness SLI (Kafka consumer lag):
+   max(kafka_consumer_lag) < 1000 messages
+
+   SLO: 99% of time, lag < 1000
+```
+
+### SRE workflow
+
+```
+       ┌───────────────────────────────────────────────────────────┐
+       │                                                           │
+       ▼                                                           │
+  ┌─────────┐                                                      │
+  │ Define  │ ─────▶ SLI metric (Prometheus)                       │
+  │ SLO     │                                                      │
+  └─────────┘                                                      │
+       │                                                           │
+       ▼                                                           │
+  ┌─────────┐                                                      │
+  │ Compute │ ─────▶ Error budget remaining                        │
+  │ budget  │                                                      │
+  └────┬────┘                                                      │
+       │                                                           │
+       ├──▶ Còn budget ──▶ Ship feature, accept risk ──────────────┤
+       │                                                           │
+       └──▶ Hết budget ──▶ Freeze feature, fix reliability ────────┘
+                          Postmortem → policy mới
+```
+
+### Postmortem (không đổ lỗi)
+
+Khi vi phạm SLO:
+1. **Timeline** — chuyện gì xảy ra, lúc nào, ai phát hiện.
+2. **Impact** — bao nhiêu user, bao nhiêu phút, ảnh hưởng nghiệp vụ.
+3. **Root cause** — 5 Whys.
+4. **What went well / poorly** — alert có hoạt động? on-call có nhanh không?
+5. **Action items** — cụ thể, có owner, có deadline.
+
+Không nêu "do bạn X làm sai" — nêu "process / safety nét bị thiếu chỗ nào".
+
+### Lưu ý vận hành
+
+- SLO nên xuất phát từ **user pain**, không phải tròn trịa 99.99% cho oai.
+- Đo từ **góc nhìn user** (synthetic probe ngoài VPC) — không chỉ từ server log.
+- Mỗi service có SLO riêng; service hạ tầng (DB, Kafka) có SLO nội bộ chặt hơn.
+- Review SLO 6 tháng / lần — điều chỉnh theo realistic load.
+
+---
+
 ## Tài liệu tham khảo
 
 ### Spring & Resilience
@@ -4449,4 +6274,9 @@ Strategies:
 | 2026-05-12 | Bổ sung Phần F — Distributed Systems (4 mục): CAP/PACELC, Saga, Event Sourcing, Sharding | §44-47 |
 | 2026-05-12 | Bổ sung Phần G — Spring Boot Internals (4 mục): Auto-config, Bean lifecycle, AOP proxy, @Transactional pitfalls | §48-51 |
 | 2026-05-12 | Bổ sung Phần H — Database Deep Dive (4 mục): MVCC, index internals, query planner, caching patterns | §52-55 |
+| 2026-05-14 | Bổ sung Phần I — Microservices Communication (3 mục): Service Mesh / Sidecar, gRPC vs REST vs GraphQL, API Gateway & BFF | §56-58 |
+| 2026-05-14 | Bổ sung Phần J — Kafka Deep Dive (3 mục): Architecture & Replication (ISR), Consumer Group & Rebalancing, Exactly-Once Semantics | §59-61 |
+| 2026-05-14 | Bổ sung Phần K — Domain-Driven Design (3 mục): Bounded Context & Context Map, Aggregate / Entity / VO, Domain Events & Anti-Corruption Layer | §62-64 |
+| 2026-05-14 | Bổ sung Phần L — Modern Java & Reactive (3 mục): Java 21+ (Records, Sealed, Pattern Matching), Structured Concurrency (JEP 453), WebFlux & Backpressure | §65-67 |
+| 2026-05-14 | Bổ sung Phần M — Performance Engineering (3 mục): JVM Profiling (JFR, async-profiler, Flame Graph), Tail Latency, SLO/SLI/Error Budget | §68-70 |
 | 2026-05-12 | Thêm sơ đồ ASCII: Circuit Breaker state machine, Outbox 4-scenarios, Distributed Tracing W3C, Bean lifecycle, AOP proxy flow | §8,9,13,49,50 |
